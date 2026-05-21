@@ -300,11 +300,6 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"MOD='" ABK_META_MOUNT_DATA_DIR "'\n"
 		"WEB='" ABK_META_MOUNT_WEB_ROOT "'\n"
 		"MARK='" ABK_META_MOUNT_MARKER "'\n"
-		"if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then exit 0; fi\n"
-		"if [ -L \"$MARK\" ]; then\n"
-		"  CUR=$(readlink \"$MARK\" 2>/dev/null || true)\n"
-		"  [ \"$CUR\" = \"$MOD\" ] || exit 0\n"
-		"fi\n"
 		"mkdir -p \"$MOD\" \"$WEB\"\n"
 		"cat > \"$MOD/module.prop\" <<'ABK_META_PROP'\n"
 		"id=" ABK_META_MOUNT_ID "\n"
@@ -314,6 +309,8 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"author=" ABK_META_MOUNT_AUTHOR "\n"
 		"description=" ABK_META_MOUNT_DESC "\n"
 		"metamodule=1\n"
+		"mount=false\n"
+		"skip_mount=true\n"
 		"web=1\n"
 		"webui=1\n"
 		"action=1\n"
@@ -332,7 +329,19 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"cat > \"$WEB/index.html\" <<'ABK_META_WEB'\n"
 		"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ABK Meta Mount</title><style>body{font-family:system-ui,sans-serif;margin:20px;line-height:1.45;color:#171717;background:#f7f7f4}main{max-width:760px}button{padding:10px 14px;margin:0 8px 10px 0;border:1px solid #888;background:#fff;border-radius:6px}pre{white-space:pre-wrap;background:#101820;color:#eef5f5;padding:12px;border-radius:6px;min-height:180px;overflow:auto}</style></head><body><main><h1>ABK Meta Mount</h1><p>Built-in KernelSU metamodule provider. Disable is persistent; already-mounted overlays may require reboot to fully unwind.</p><button onclick=\"refresh()\">Refresh</button><button onclick=\"setEnabled(1)\">Enable</button><button onclick=\"setEnabled(0)\">Disable</button><pre id=\"out\">Loading...</pre></main><script>function out(v){document.getElementById('out').textContent=v}function sh(c){try{if(window.ksu&&typeof window.ksu.exec==='function'){return window.ksu.exec(c)}return 'KernelSU WebUI exec API unavailable'}catch(e){return String(e)}}function refresh(){out(sh('cat /proc/abk_meta_mount/status 2>/dev/null || echo unavailable'))}function setEnabled(v){var c='echo '+v+' > /sys/kernel/abk_meta_mount/enabled';if(v==1)c=c+'; echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true';out(sh(c+'; cat /proc/abk_meta_mount/status 2>/dev/null || true'))}refresh()</script></body></html>\n"
 		"ABK_META_WEB\n"
-		"ln -sfn \"$MOD\" \"$MARK\"\n";
+		"if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then exit 0; fi\n"
+		"TAKEOVER=0\n"
+		"if [ ! -e \"$MARK\" ]; then\n"
+		"  TAKEOVER=1\n"
+		"elif [ -L \"$MARK\" ]; then\n"
+		"  CUR=$(readlink \"$MARK\" 2>/dev/null || true)\n"
+		"  if [ \"$CUR\" = \"$MOD\" ]; then\n"
+		"    TAKEOVER=1\n"
+		"  elif [ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ]; then\n"
+		"    TAKEOVER=1\n"
+		"  fi\n"
+		"fi\n"
+		"[ \"$TAKEOVER\" = 1 ] && ln -sfn \"$MOD\" \"$MARK\"\n";
 	int ret;
 
 	if (!abk_meta_mount_path_exists("/data/adb"))
@@ -368,7 +377,10 @@ static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 		 "if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then exit 0; fi\n"
 		 "if [ -L \"$MARK\" ]; then\n"
 		 "  CUR=$(readlink \"$MARK\" 2>/dev/null || true)\n"
-		 "  [ \"$CUR\" = \"$MOD\" ] || exit 0\n"
+		 "  if [ \"$CUR\" != \"$MOD\" ]; then\n"
+		 "    [ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ] || exit 0\n"
+		 "    ln -sfn \"$MOD\" \"$MARK\"\n"
+		 "  fi\n"
 		 "fi\n"
 		 "REL=\"${T#/}\"\n"
 		 "case \"$T\" in\n"
@@ -554,6 +566,13 @@ static const struct abk_control_ops abk_meta_mount_control_ops = {
 	.name = ABK_META_MOUNT_NAME,
 	.version = ABK_META_MOUNT_VERSION,
 	.description = ABK_META_MOUNT_DESC,
+#ifdef ABK_CONTROL_OPS_HAS_RUNTIME_UI
+	.module_dir = ABK_META_MOUNT_DATA_DIR,
+	.web_root = ABK_META_MOUNT_WEB_ROOT,
+	.has_web_ui = true,
+	.has_action_script = true,
+	.action_supported = true,
+#endif
 	.is_enabled = abk_meta_mount_control_is_enabled,
 	.set_enabled = abk_meta_mount_control_set_enabled,
 };

@@ -89,7 +89,15 @@ done
 driver="$KERNEL_ROOT/common/drivers/abk_meta_mount/abk_meta_mount.c"
 assert_contains '#if IS_ENABLED(CONFIG_ABK_CONTROL)' "$driver"
 assert_contains 'abk_control_register(&abk_meta_mount_control_ops)' "$driver"
+assert_contains 'ABK_CONTROL_OPS_HAS_RUNTIME_UI' "$driver"
+assert_contains '.web_root = ABK_META_MOUNT_WEB_ROOT' "$driver"
+assert_contains '.has_web_ui = true' "$driver"
 assert_contains 'metamodule=1' "$driver"
+assert_contains 'mount=false' "$driver"
+assert_contains 'skip_mount=true' "$driver"
 assert_contains '/sys/kernel/abk_meta_mount/prepare' "$driver"
+assert_contains 'TAKEOVER=0' "$driver"
+assert_contains '[ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ]' "$driver"
+assert_contains 'ln -sfn \"$MOD\" \"$MARK\"' "$driver"
 
 printf 'abk_meta_mount setup test passed\n'

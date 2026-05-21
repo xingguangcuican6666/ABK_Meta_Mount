@@ -5,7 +5,7 @@ KernelSU-compatible metamodule provider into `common/drivers`.
 
 The kernel driver creates a runtime compatibility module at
 `/data/adb/modules/meta-abk-mount`, writes `module.prop` with `metamodule=1`,
-and owns `/data/adb/metamodule` when no other metamodule is already active.
+and owns `/data/adb/metamodule` when no other valid metamodule is already active.
 This makes KernelSU and ABK's runtime module list see a metamodule, while the
 actual provider is built into the kernel.
 
@@ -17,7 +17,7 @@ actual provider is built into the kernel.
 - Enables OverlayFS, tmpfs, tmpfs xattrs, tmpfs POSIX ACLs, and procfs during
   the `before_build` stage.
 - Creates a KernelSU-compatible module directory containing:
-  - `module.prop` with `metamodule=1`, `web=1`, and `action=1`
+  - `module.prop` with `metamodule=1`, `mount=false`, `web=1`, and `action=1`
   - `metamount.sh`
   - `action.sh`
   - `webroot/index.html`
@@ -46,10 +46,12 @@ installs them again idempotently and enables the required defconfig symbols.
 On boot, the driver waits until `/data/adb` and `/system/bin/sh` are available.
 It then writes the compatibility module files and creates
 `/data/adb/metamodule -> /data/adb/modules/meta-abk-mount` if that marker is
-absent or already points to this module.
+absent, already points to this module, points to a missing module, or points to
+a module with `disable` or `remove`.
 
-If `/data/adb/metamodule` already points to another metamodule, ABK Meta Mount
-does not take over the marker and does not mount overlays.
+If `/data/adb/metamodule` already points to another enabled metamodule, ABK
+Meta Mount still generates its compatibility module directory, but does not take
+over the marker and does not mount overlays.
 
 Disabling through WebUI, ABK Control, or
 `echo 0 > /sys/kernel/abk_meta_mount/enabled` writes
@@ -66,6 +68,8 @@ module is also built and provides `CONFIG_ABK_CONTROL`, this driver registers:
 - name: `ABK Meta Mount`
 - version: `0.1.0`
 - description: `Built-in KernelSU-compatible metamodule provider`
+- module dir: `/data/adb/modules/meta-abk-mount`
+- WebUI/action support
 - enable/disable callbacks
 
 When ABK Control is not built, the registration code is compiled out.

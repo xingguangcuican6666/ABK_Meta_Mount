@@ -36,6 +36,8 @@ entry point ABK calls.
 - The driver is built into the kernel, not installed as a normal module.
 - It creates a compatibility module under `/data/adb/modules/meta-abk-mount`
   so KernelSU and ABK can discover a metamodule entry.
+- It takes over `/data/adb/metamodule` only when the existing target is absent,
+  missing, disabled, removed, or already points to `meta-abk-mount`.
 - It exposes runtime control through sysfs and procfs.
 - It optionally registers with ABK Control only when `CONFIG_ABK_CONTROL` is
   enabled in the kernel tree.

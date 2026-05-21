@@ -1,187 +1,88 @@
-# ABK External Module Template
+# ABK Meta Mount
 
-Template repository for AnyBase Kernel (ABK) custom external modules.
+ABK Meta Mount is an ABK custom external module that injects a built-in
+KernelSU-compatible metamodule provider into `common/drivers`.
 
-ABK clones external module repositories during the kernel build and runs
-`setup.sh` from the repository root at the configured injection stage. This
-template is intentionally safe by default: it logs the build context and does
-not modify the kernel tree until you add your own logic.
+The kernel driver creates a runtime compatibility module at
+`/data/adb/modules/meta-abk-mount`, writes `module.prop` with `metamodule=1`,
+and owns `/data/adb/metamodule` when no other metamodule is already active.
+This makes KernelSU and ABK's runtime module list see a metamodule, while the
+actual provider is built into the kernel.
 
-## Usage
+## Features
 
-Enable "custom external modules" in the ABK app or GitHub Actions.
+- Copies `drivers/abk_meta_mount` and `include/linux/abk_meta_mount.h` into the
+  ABK kernel tree.
+- Adds `CONFIG_ABK_META_MOUNT` to `common/drivers/Kconfig` and `Makefile`.
+- Enables OverlayFS, tmpfs, tmpfs xattrs, tmpfs POSIX ACLs, and procfs during
+  the `before_build` stage.
+- Creates a KernelSU-compatible module directory containing:
+  - `module.prop` with `metamodule=1`, `web=1`, and `action=1`
+  - `metamount.sh`
+  - `action.sh`
+  - `webroot/index.html`
+- Provides runtime controls:
+  - `/sys/kernel/abk_meta_mount/enabled`
+  - `/sys/kernel/abk_meta_mount/prepare`
+  - `/proc/abk_meta_mount/status`
+- Mounts enabled ordinary module layers over `/system`, `/vendor`, `/product`,
+  `/system_ext`, `/odm`, and `/oem` with OverlayFS.
+- Optionally registers with ABK Control through `abk_control_register()` only
+  when `CONFIG_ABK_CONTROL` is enabled.
 
-In the ABK app, add the repository URL. The app reads `module.conf`, verifies
-the supported stages, then asks the user which stage or stages to add:
+## ABK Usage
+
+Use both stages:
 
 ```text
-https://github.com/your-name/your-module.git
+https://github.com/your-name/ABK_Meta_Mount.git;after_patch|https://github.com/your-name/ABK_Meta_Mount.git;before_build
 ```
 
-For raw GitHub Actions input, pass `repo_url;stage` entries:
+`after_patch` installs the source files and Kconfig hooks. `before_build`
+installs them again idempotently and enables the required defconfig symbols.
 
-```text
-https://github.com/your-name/your-module.git;after_patch
-```
+## Runtime Behavior
 
-Multiple modules are separated with `|`:
+On boot, the driver waits until `/data/adb` and `/system/bin/sh` are available.
+It then writes the compatibility module files and creates
+`/data/adb/metamodule -> /data/adb/modules/meta-abk-mount` if that marker is
+absent or already points to this module.
 
-```text
-https://github.com/your-name/module-a.git;after_patch|https://github.com/your-name/module-b.git;before_build
-```
+If `/data/adb/metamodule` already points to another metamodule, ABK Meta Mount
+does not take over the marker and does not mount overlays.
 
-Supported stages:
+Disabling through WebUI, ABK Control, or
+`echo 0 > /sys/kernel/abk_meta_mount/enabled` writes
+`/data/adb/modules/meta-abk-mount/disable` and attempts to unmount active
+overlays. A reboot may still be needed to fully unwind already-mounted
+partitions.
 
-| Stage | Timing | Typical use |
-| --- | --- | --- |
-| `after_patch` | After ABK finishes built-in source integrations such as SUSFS, ZRAM, BBG, DDK, Re-Kernel, NTsync, IPSet, and BBR | Apply source patches, copy driver files, edit Kconfig or Makefile files |
-| `before_build` | After ABK sets the kernel name and build timestamp, immediately before compilation | Final defconfig edits, generated files, validation checks |
+## ABK Control
 
-`befor_build` is accepted by ABK as a compatibility alias, but new modules
-should use `before_build`.
+This repository does not include ABK Control. If the separate ABK Control
+module is also built and provides `CONFIG_ABK_CONTROL`, this driver registers:
 
-## module.conf Metadata
+- id: `meta-abk-mount`
+- name: `ABK Meta Mount`
+- version: `0.1.0`
+- description: `Built-in KernelSU-compatible metamodule provider`
+- enable/disable callbacks
 
-`module.conf` is now part of the ABK module contract. The app uses it for
-validation, stage selection, and module repository display. Keep it
-shell-compatible because `setup.sh` also sources it.
+When ABK Control is not built, the registration code is compiled out.
 
-| Field | Required | Meaning |
-| --- | --- | --- |
-| `ABK_MODULE_NAME` | Yes | Display name |
-| `ABK_MODULE_ID` | Recommended | Stable id used by metadata/control integrations |
-| `ABK_MODULE_VERSION` | Recommended | Display version |
-| `ABK_MODULE_DESCRIPTION` | Recommended | Short display description |
-| `ABK_MODULE_REPO_URL` | Recommended | Canonical repository URL |
-| `ABK_MODULE_SUPPORTED_STAGES` | Recommended | Comma-separated list, usually `after_patch,before_build` |
-| `ABK_MODULE_DEFAULT_STAGE` | Recommended | Stage preselected when no recommendation is available |
-| `ABK_MODULE_RECOMMENDED_STAGES` | Recommended | Comma-separated stages marked as recommended in the app |
+## Verification
 
-Example:
+Run the local fixture test:
 
 ```bash
-ABK_MODULE_ID="example_feature"
-ABK_MODULE_NAME="Example Feature"
-ABK_MODULE_VERSION="1.0.0"
-ABK_MODULE_DESCRIPTION="Patch and configure an example kernel feature."
-ABK_MODULE_REPO_URL="https://github.com/your-name/example-feature"
-ABK_MODULE_SUPPORTED_STAGES="after_patch,before_build"
-ABK_MODULE_DEFAULT_STAGE="after_patch"
-ABK_MODULE_RECOMMENDED_STAGES="after_patch,before_build"
+bash -n setup.sh scripts/libabk.sh scripts/abk_meta_mount_setup.sh tests/abk_meta_mount_setup_test.sh
+bash tests/abk_meta_mount_setup_test.sh
 ```
 
-When publishing through a central module repository, point the catalog item
-`repoUrl` to this module repository and mirror the same `supportedStages`,
-`defaultStage`, and `recommendedStages` values in the catalog JSON.
+The fixture checks that setup is idempotent, required files are copied, config
+symbols are written once, and ABK Control registration remains conditional.
 
-## Repository Layout
+## References
 
-```text
-.
-|-- setup.sh
-|-- module.conf
-|-- scripts/
-|   `-- libabk.sh
-|-- patches/
-|   `-- README.md
-|-- files/
-|   `-- README.md
-`-- docs/
-    `-- development.md
-```
-
-Required entry point:
-
-- `setup.sh` must exist at the repository root.
-- ABK executes it with `bash setup.sh`.
-- The current working directory is the module repository root.
-
-Recommended workflow:
-
-1. Create a new repository from this template.
-2. Update `module.conf` with your module name, version, and description.
-3. Put patch files under `patches/`.
-4. Put source files or templates under `files/`.
-5. Implement stage-specific logic in `setup.sh`.
-6. Keep every operation idempotent.
-
-## Minimal Example
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-MODULE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$MODULE_DIR/module.conf" ]; then
-  source "$MODULE_DIR/module.conf"
-fi
-source "$MODULE_DIR/scripts/libabk.sh"
-
-abk_require_env KERNEL_ROOT DEFCONFIG CUSTOM_EXTERNAL_MODULE_STAGE
-
-case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
-  after_patch)
-    abk_apply_patch_dir "$MODULE_DIR/patches/common"
-    ;;
-  before_build)
-    abk_enable_config CONFIG_EXAMPLE_FEATURE
-    ;;
-esac
-```
-
-## Common Environment Variables
-
-| Variable | Meaning |
-| --- | --- |
-| `GITHUB_WORKSPACE` | GitHub Actions workspace and ABK repository root |
-| `CONFIG` | Build tuple, for example `android15-6.6-118` |
-| `KERNEL_ROOT` | Kernel source directory |
-| `DEFCONFIG` | GKI defconfig path |
-| `CUSTOM_EXTERNAL_MODULE_STAGE` | Current stage, `after_patch` or `before_build` |
-| `CUSTOM_EXTERNAL_MODULES_MANIFEST` | Parsed ABK module manifest |
-| `ZZH_PATCHES` | ABK repository root |
-| `SUSFS4KSU` | SUSFS repository path when SUSFS is enabled |
-| `KERNEL_PATCHES` | `WildKernels/kernel_patches` repository path |
-| `SUKISU_PATCHES` | `ShirkNeko/SukiSU_patch` repository path |
-| `ANYKERNEL3` | AnyKernel3 repository path |
-| `ACTION_BUILD` | Action-Build repository path |
-| `KBUILD_BUILD_TIMESTAMP` | Available in `before_build` |
-| `KBUILD_BUILD_VERSION` | Available in `before_build` |
-
-Build-parameter variables exported to modules:
-
-| Variable | Meaning |
-| --- | --- |
-| `ABK_BUILD_ANDROID_VERSION` | Selected Android branch, for example `android14` |
-| `ABK_BUILD_KERNEL_VERSION` | Selected kernel line, for example `6.1` |
-| `ABK_BUILD_SUB_LEVEL` | Selected sublevel |
-| `ABK_BUILD_OS_PATCH_LEVEL` | Selected Android security patch level |
-| `ABK_BUILD_REVISION` | Selected kernel revision |
-| `ABK_BUILD_KSU_VARIANT` | KernelSU variant |
-| `ABK_BUILD_KSU_BRANCH` | KernelSU branch label |
-| `ABK_BUILD_VERSION` | Custom kernel local version input |
-| `ABK_BUILD_TIME` | Build timestamp input |
-| `ABK_BUILD_VIRTUALIZATION_SUPPORT` | Virtualization support setting |
-| `ABK_BUILD_ZRAM_EXTRA_ALGOS` | Extra ZRAM algorithm list |
-
-Feature flags are exported as `true` or `false`: `ABK_FEATURE_USE_ZRAM`,
-`ABK_FEATURE_USE_BBG`, `ABK_FEATURE_USE_DDK`, `ABK_FEATURE_USE_NTSYNC`,
-`ABK_FEATURE_USE_NETWORKING`, `ABK_FEATURE_USE_KPM`,
-`ABK_FEATURE_USE_REKERNEL`, `ABK_FEATURE_ENABLE_SUSFS`,
-`ABK_FEATURE_SUPP_OP`, and `ABK_FEATURE_ZRAM_FULL_ALGO`.
-
-See [docs/development.md](docs/development.md) for the full development guide.
-
-## Safety Rules
-
-- Do not commit tokens, private keys, device private data, or opaque binaries.
-- Do not download and execute unaudited remote scripts.
-- Validate kernel versions and target files before modifying the source tree.
-- Fail clearly with `exit 1` when a required condition is not met.
-- Prefer changing only `$KERNEL_ROOT`, `$DEFCONFIG`, or files inside this
-  module repository.
-
-## License
-
-GPL-3.0. Make sure any third-party code or patches you add are compatible with
-the target kernel and this repository license.
+- KernelSU metamodule guide: <https://kernelsu.org/guide/metamodule.html>
+- KernelSU module WebUI guide: <https://kernelsu.org/guide/module-webui.html>

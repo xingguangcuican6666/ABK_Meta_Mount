@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+config ABK_META_MOUNT
+	bool "ABK Meta Mount built-in metamodule provider"
+	depends on TMPFS
+	select OVERLAY_FS
+	select TMPFS_XATTR
+	select TMPFS_POSIX_ACL
+	help
+	  Provide a built-in KernelSU-compatible metamodule marker and
+	  prepare systemless overlay mounts for read-only Android partitions.
+	  If ABK Control is built, the driver registers a controllable runtime
+	  entry. Without ABK Control it still initializes independently.

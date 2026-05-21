@@ -1,21 +1,7 @@
 # files/
 
-Place source files, Kconfig files, Makefile snippets, or generated templates
-that should be copied into `$KERNEL_ROOT`.
+Files in this directory are copied into the ABK kernel tree by
+`scripts/abk_meta_mount_setup.sh`.
 
-Example layout:
-
-```text
-files/
-`-- drivers/
-    `-- example/
-        |-- Kconfig
-        |-- Makefile
-        `-- example.c
-```
-
-Example usage in `setup.sh`:
-
-```bash
-abk_copy_into_kernel "$MODULE_DIR/files/drivers/example" "common/drivers/example"
-```
+- `drivers/abk_meta_mount/` -> `common/drivers/abk_meta_mount/`
+- `include/linux/abk_meta_mount.h` -> `common/include/linux/abk_meta_mount.h`

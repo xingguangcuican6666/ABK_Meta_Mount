@@ -64,6 +64,8 @@ partitions.
 module generator, including whether `/data/adb`, `/system/bin/sh`,
 `action.sh`, and `webroot/index.html` are visible, plus the most recent shell,
 compat-module, and prepare return codes.
+Each target line also reports its last status file and the resolved lowerdir
+list that was used for the mount attempt.
 
 ## ABK Control
 

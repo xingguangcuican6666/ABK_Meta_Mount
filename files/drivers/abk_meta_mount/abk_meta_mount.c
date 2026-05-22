@@ -2,6 +2,7 @@
 #include <linux/abk_meta_mount.h>
 #include <linux/atomic.h>
 #include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -40,6 +41,8 @@ struct abk_meta_mount_target {
 	char name[32];
 	unsigned long flags;
 	bool ready;
+	int last_ret;
+	unsigned long last_attempt_jiffies;
 	struct list_head node;
 };
 
@@ -59,6 +62,7 @@ static bool abk_meta_mount_registered_control;
 static int abk_meta_mount_run_shell(const char *script);
 static int abk_meta_mount_ensure_compat_module(void);
 static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target);
+static bool abk_meta_mount_has_unready_targets(void);
 static void abk_meta_mount_schedule_retry(void);
 
 static const char * const abk_meta_mount_default_targets[] = {
@@ -191,6 +195,8 @@ int abk_meta_mount_register_target(const char *path, unsigned long flags)
 	strscpy(target->path, path, sizeof(target->path));
 	abk_meta_mount_target_name(path, target->name, sizeof(target->name));
 	target->flags = flags;
+	target->last_ret = 0;
+	target->last_attempt_jiffies = 0;
 	list_add_tail(&target->node, &abk_meta_mount_targets);
 	mutex_unlock(&abk_meta_mount_lock);
 
@@ -239,11 +245,10 @@ int abk_meta_mount_set_enabled(bool enabled)
 		if (abk_meta_mount_work_initialized)
 			cancel_delayed_work_sync(&abk_meta_mount_work);
 		ret = abk_meta_mount_prepare_all();
-		if (ret) {
+		if (ret || abk_meta_mount_has_unready_targets()) {
 			abk_meta_mount_schedule_retry();
-			if (ret != -ENOENT)
+			if (ret && ret != -ENOENT)
 				pr_warn("abk_meta_mount: enable prepare failed: %d\n", ret);
-			ret = 0;
 		}
 	} else {
 		mutex_lock(&abk_meta_mount_lock);
@@ -336,7 +341,7 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"ABK_META_ACTION\n"
 		"chmod 755 \"$MOD/action.sh\"\n"
 		"cat > \"$WEB/index.html\" <<'ABK_META_WEB'\n"
-		"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ABK Meta Mount</title><style>body{font-family:system-ui,sans-serif;margin:20px;line-height:1.45;color:#171717;background:#f7f7f4}main{max-width:760px}button{padding:10px 14px;margin:0 8px 10px 0;border:1px solid #888;background:#fff;border-radius:6px}pre{white-space:pre-wrap;background:#101820;color:#eef5f5;padding:12px;border-radius:6px;min-height:180px;overflow:auto}</style></head><body><main><h1>ABK Meta Mount</h1><p>Built-in KernelSU metamodule provider. Disable is persistent; already-mounted overlays may require reboot to fully unwind.</p><button onclick=\"refresh()\">Refresh</button><button onclick=\"setEnabled(1)\">Enable</button><button onclick=\"setEnabled(0)\">Disable</button><pre id=\"out\">Loading...</pre></main><script>function out(v){document.getElementById('out').textContent=v}function sh(c){try{if(window.ksu&&typeof window.ksu.exec==='function'){return window.ksu.exec(c)}return 'KernelSU WebUI exec API unavailable'}catch(e){return String(e)}}function refresh(){out(sh('cat /proc/abk_meta_mount/status 2>/dev/null || echo unavailable'))}function setEnabled(v){var c;if(v==1){c='rm -f /data/adb/modules/meta-abk-mount/disable /data/adb/modules/meta-abk-mount/remove; echo 1 > /sys/kernel/abk_meta_mount/enabled; echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true'}else{c='mkdir -p /data/adb/modules/meta-abk-mount; touch /data/adb/modules/meta-abk-mount/disable; echo 0 > /sys/kernel/abk_meta_mount/enabled'}out(sh(c+'; cat /proc/abk_meta_mount/status 2>/dev/null || true'))}refresh()</script></body></html>\n"
+		"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ABK Meta Mount</title><style>body{font-family:system-ui,sans-serif;margin:20px;line-height:1.45;color:#171717;background:#f7f7f4}main{max-width:760px}button{padding:10px 14px;margin:0 8px 10px 0;border:1px solid #888;background:#fff;border-radius:6px}pre{white-space:pre-wrap;background:#101820;color:#eef5f5;padding:12px;border-radius:6px;min-height:180px;overflow:auto}</style></head><body><main><h1>ABK Meta Mount</h1><p>Built-in KernelSU metamodule provider. Disable is persistent; already-mounted overlays may require reboot to fully unwind.</p><button onclick=\"refresh()\">Refresh</button><button onclick=\"setEnabled(1)\">Enable</button><button onclick=\"setEnabled(0)\">Disable</button><pre id=\"out\">Loading...</pre></main><script>function out(v){document.getElementById('out').textContent=v}function sh(c){try{if(window.ksu&&typeof window.ksu.exec==='function'){return window.ksu.exec(c)}return 'KernelSU WebUI exec API unavailable'}catch(e){return String(e)}}function refresh(){out(sh('echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true; cat /proc/abk_meta_mount/status 2>/dev/null || echo unavailable'))}function setEnabled(v){var c;if(v==1){c='rm -f /data/adb/modules/meta-abk-mount/disable /data/adb/modules/meta-abk-mount/remove; echo 1 > /sys/kernel/abk_meta_mount/enabled; echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true'}else{c='mkdir -p /data/adb/modules/meta-abk-mount; touch /data/adb/modules/meta-abk-mount/disable; echo 0 > /sys/kernel/abk_meta_mount/enabled'}out(sh(c+'; cat /proc/abk_meta_mount/status 2>/dev/null || true'))}refresh()</script></body></html>\n"
 		"ABK_META_WEB\n"
 		"if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then exit 0; fi\n"
 		"TAKEOVER=0\n"
@@ -366,15 +371,23 @@ static int abk_meta_mount_ensure_compat_module(void)
 
 static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 {
-	char script[2048];
+	char script[4096];
 	int len;
 	int ret;
 
-	if (!target || target->ready)
+	if (!target)
 		return 0;
+	target->last_attempt_jiffies = jiffies;
+	target->last_ret = 0;
+	if (target->ready) {
+		if (abk_meta_mount_is_overlay_mount(target->path))
+			return 0;
+		target->ready = false;
+	}
 	if (!abk_meta_mount_path_exists(target->path)) {
 		if (!(target->flags & ABK_META_MOUNT_TARGET_OPTIONAL))
 			pr_warn("abk_meta_mount: target missing: %s\n", target->path);
+		target->last_ret = (target->flags & ABK_META_MOUNT_TARGET_OPTIONAL) ? 0 : -ENOENT;
 		return (target->flags & ABK_META_MOUNT_TARGET_OPTIONAL) ? 0 : -ENOENT;
 	}
 
@@ -385,11 +398,17 @@ static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 		 "R='" ABK_META_MOUNT_ROOT "'\n"
 		 "MOD='" ABK_META_MOUNT_DATA_DIR "'\n"
 		 "MARK='" ABK_META_MOUNT_MARKER "'\n"
-		 "if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then exit 0; fi\n"
+		 "D=\"$R/$N\"\n"
+		 "STATUS=\"$D/status\"\n"
+		 "LOWERFILE=\"$D/lowerdir\"\n"
+		 "mkdir -p \"$D\"\n"
+		 ": > \"$STATUS\"\n"
+		 ": > \"$LOWERFILE\"\n"
+		 "if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then printf 'foreign_marker\\n' > \"$STATUS\"; exit 0; fi\n"
 		 "if [ -L \"$MARK\" ]; then\n"
 		 "  CUR=$(readlink \"$MARK\" 2>/dev/null || true)\n"
 		 "  if [ \"$CUR\" != \"$MOD\" ]; then\n"
-		 "    [ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ] || exit 0\n"
+		 "    [ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ] || { printf 'other_metamodule\\n' > \"$STATUS\"; exit 0; }\n"
 		 "    ln -sfn \"$MOD\" \"$MARK\"\n"
 		 "  fi\n"
 		 "fi\n"
@@ -416,17 +435,33 @@ static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 		 "    LOWERS=\"$M/$C${LOWERS:+:$LOWERS}\"\n"
 		 "  done\n"
 		 "done\n"
-		 "[ -n \"$LOWERS\" ] || exit 0\n"
+		 "if [ -z \"$LOWERS\" ]; then\n"
+		 "  printf 'no_candidates\\n' > \"$STATUS\"\n"
+		 "  exit 0\n"
+		 "fi\n"
 		 "LOWERS=\"$LOWERS:$T\"\n"
+		 "printf '%s\\n' \"$LOWERS\" > \"$LOWERFILE\"\n"
 		 "mkdir -p \"$R/$N/upper\" \"$R/$N/work\"\n"
-		 "if grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1; then exit 0; fi\n"
-		 "mount -t overlay KSU -o lowerdir=\"$LOWERS\",upperdir=\"$R/$N/upper\",workdir=\"$R/$N/work\" \"$T\" 2>/dev/null\n"
-		 "grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1\n",
+		 "if grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1; then\n"
+		 "  printf 'already_overlay\\n' > \"$STATUS\"\n"
+		 "  exit 0\n"
+		 "fi\n"
+		 "if mount -t overlay KSU -o lowerdir=\"$LOWERS\",upperdir=\"$R/$N/upper\",workdir=\"$R/$N/work\" \"$T\" 2>/dev/null; then\n"
+		 "  if grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1; then\n"
+		 "    printf 'mounted\\n' > \"$STATUS\"\n"
+		 "    exit 0\n"
+		 "  fi\n"
+		 "fi\n"
+		 "printf 'mount_failed\\n' > \"$STATUS\"\n"
+		 "exit 4\n",
 		 target->path, target->name);
-	if (len < 0 || len >= sizeof(script))
+	if (len < 0 || len >= sizeof(script)) {
+		target->last_ret = -E2BIG;
 		return -E2BIG;
+	}
 
 	ret = abk_meta_mount_run_shell(script);
+	target->last_ret = ret;
 	if (ret)
 		return ret;
 
@@ -466,6 +501,23 @@ int abk_meta_mount_prepare_all(void)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(abk_meta_mount_prepare_all);
+
+static bool abk_meta_mount_has_unready_targets(void)
+{
+	struct abk_meta_mount_target *target;
+	bool unready = false;
+
+	mutex_lock(&abk_meta_mount_lock);
+	list_for_each_entry(target, &abk_meta_mount_targets, node) {
+		if (!target->ready) {
+			unready = true;
+			break;
+		}
+	}
+	mutex_unlock(&abk_meta_mount_lock);
+
+	return unready;
+}
 
 static ssize_t enabled_show(struct kobject *kobj,
 			    struct kobj_attribute *attr, char *buf)
@@ -516,6 +568,8 @@ static ssize_t prepare_store(struct kobject *kobj,
 			abk_meta_mount_schedule_retry();
 			return count;
 		}
+		if (abk_meta_mount_has_unready_targets())
+			abk_meta_mount_schedule_retry();
 	}
 	return count;
 }
@@ -529,9 +583,38 @@ static struct kobject *abk_meta_mount_kobj;
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 
+static void abk_meta_mount_seq_print_file(struct seq_file *m, const char *path)
+{
+	struct file *file;
+	loff_t pos = 0;
+	char buf[512];
+	ssize_t len;
+
+	file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file)) {
+		seq_puts(m, "-");
+		return;
+	}
+
+	len = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+	filp_close(file, NULL);
+	if (len <= 0) {
+		seq_puts(m, "-");
+		return;
+	}
+
+	buf[len] = '\0';
+	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+		buf[--len] = '\0';
+
+	seq_puts(m, buf);
+}
+
 static int abk_meta_mount_status_show(struct seq_file *m, void *v)
 {
 	struct abk_meta_mount_target *target;
+	char status_path[128];
+	char lower_path[128];
 
 	(void)v;
 
@@ -564,8 +647,22 @@ static int abk_meta_mount_status_show(struct seq_file *m, void *v)
 
 	mutex_lock(&abk_meta_mount_lock);
 	list_for_each_entry(target, &abk_meta_mount_targets, node)
-		seq_printf(m, "target=%s ready=%d\n", target->path,
-			   target->ready ? 1 : 0);
+	{
+		unsigned long age_ms = target->last_attempt_jiffies ?
+			jiffies_to_msecs(jiffies - target->last_attempt_jiffies) : 0;
+
+		scnprintf(status_path, sizeof(status_path),
+			  ABK_META_MOUNT_ROOT "/%s/status", target->name);
+		scnprintf(lower_path, sizeof(lower_path),
+			  ABK_META_MOUNT_ROOT "/%s/lowerdir", target->name);
+		seq_printf(m, "target=%s ready=%d ret=%d age_ms=%lu status=",
+			   target->path, target->ready ? 1 : 0,
+			   target->last_ret, age_ms);
+		abk_meta_mount_seq_print_file(m, status_path);
+		seq_puts(m, " lowerdir=");
+		abk_meta_mount_seq_print_file(m, lower_path);
+		seq_putc(m, '\n');
+	}
 	mutex_unlock(&abk_meta_mount_lock);
 
 	return 0;
@@ -642,14 +739,15 @@ static void abk_meta_mount_workfn(struct work_struct *work)
 	(void)work;
 
 	ret = abk_meta_mount_prepare_all();
-	if (ret)
+	if (ret || abk_meta_mount_has_unready_targets())
 		abk_meta_mount_schedule_retry();
 }
 
 static void abk_meta_mount_schedule_retry(void)
 {
-	if (abk_meta_mount_work_initialized && abk_meta_mount_is_enabled())
-		schedule_delayed_work(&abk_meta_mount_work, 10 * HZ);
+	if (abk_meta_mount_work_initialized && abk_meta_mount_is_enabled() &&
+	    !delayed_work_pending(&abk_meta_mount_work))
+		schedule_delayed_work(&abk_meta_mount_work, 60 * HZ);
 }
 
 static void abk_meta_mount_register_defaults(void)

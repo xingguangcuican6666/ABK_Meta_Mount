@@ -23,6 +23,10 @@ actual provider is built into the kernel.
   - `metamount.sh`
   - `action.sh`
   - `webroot/index.html`
+- Creates a helper ordinary module at
+  `/data/adb/modules/abk-meta-mount-runtime` whose `post-fs-data.sh` and
+  `service.sh` stage ordinary module trees into `/mnt/abk_meta_mount/modules`
+  before the kernel consumes them.
 - Provides runtime controls:
   - `/sys/kernel/abk_meta_mount/enabled`
   - `/sys/kernel/abk_meta_mount/prepare`
@@ -64,9 +68,9 @@ overlays. A reboot may still be needed to fully unwind already-mounted
 partitions.
 
 Target preparation scans `/data/adb/modules` in the kernel, skips disabled,
-removed, `skip_mount`, and metamodule directories, then builds an OverlayFS
-lowerdir list from matching partition folders such as `system`, `vendor`, and
-`system/vendor`.
+removed, `skip_mount`, and metamodule directories, then resolves staged lower
+layers from `/mnt/abk_meta_mount/modules` for matching partition folders such
+as `system`, `vendor`, and `system/vendor`.
 
 `/proc/abk_meta_mount/status` includes diagnostic fields for the compatibility
 module generator, including whether `/data/adb`, `/system/bin/sh`,

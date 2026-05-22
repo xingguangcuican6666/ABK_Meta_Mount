@@ -41,10 +41,14 @@ optional and only mirrors the source copy earlier in the flow.
 - The driver is built into the kernel, not installed as a normal module.
 - It creates a compatibility module under `/data/adb/modules/meta-abk-mount`
   so KernelSU and ABK can discover a metamodule entry.
+- It also creates a helper ordinary module under
+  `/data/adb/modules/abk-meta-mount-runtime` so KSU/ABK userland scripts can
+  stage ordinary module trees into `/mnt/abk_meta_mount/modules`.
 - It takes over `/data/adb/metamodule` only when the existing target is absent,
   missing, disabled, removed, or already points to `meta-abk-mount`.
 - It scans ordinary module directories and executes OverlayFS mounts in the
-  kernel with `path_mount()`. Shell is kept only for compatibility module file
+  kernel with `path_mount()`, but consumes staged lowerdirs from
+  `/mnt/abk_meta_mount/modules`. Shell is kept only for runtime module file
   generation.
 - It exposes runtime control through sysfs and procfs.
 - It optionally registers with ABK Control only when `CONFIG_ABK_CONTROL` is

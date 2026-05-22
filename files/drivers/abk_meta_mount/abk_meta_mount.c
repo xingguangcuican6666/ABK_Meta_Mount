@@ -39,8 +39,8 @@
 #define ABK_META_MOUNT_MARKER "/data/adb/metamodule"
 #define ABK_META_MOUNT_HELPER "/system/bin/sh"
 #define ABK_META_MOUNT_RUNTIME_ROOT "/mnt/abk_meta_mount"
-#define ABK_META_MOUNT_STAGE_MODULES_DIR ABK_META_MOUNT_RUNTIME_ROOT "/current/modules"
-#define ABK_META_MOUNT_OVERLAY_DIR ABK_META_MOUNT_RUNTIME_ROOT "/current/overlay"
+#define ABK_META_MOUNT_STAGE_MODULES_DIR ABK_META_MOUNT_RUNTIME_ROOT "/modules"
+#define ABK_META_MOUNT_OVERLAY_DIR ABK_META_MOUNT_RUNTIME_ROOT "/overlay"
 
 struct abk_meta_mount_target {
 	char path[64];
@@ -821,10 +821,8 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"WEB='" ABK_META_MOUNT_WEB_ROOT "'\n"
 		"MARK='" ABK_META_MOUNT_MARKER "'\n"
 		"RUNTIME_BASE='" ABK_META_MOUNT_RUNTIME_ROOT "'\n"
-		"CURRENT=\"$RUNTIME_BASE/current\"\n"
-		"RUNTIME_DIR=\"$RUNTIME_BASE/run-$(date +%s)-$$\"\n"
-		"STAGE=\"$RUNTIME_DIR/modules\"\n"
-		"OVERLAY=\"$RUNTIME_DIR/overlay\"\n"
+		"STAGE=\"$RUNTIME_BASE/modules\"\n"
+		"OVERLAY=\"$RUNTIME_BASE/overlay\"\n"
 		"mkdir -p \"$MOD\" \"$WEB\"\n"
 		"rm -f \"$MOD/.marker_owned\"\n"
 		"mkdir -p \"$STAGE\" \"$OVERLAY\"\n"
@@ -846,7 +844,6 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"    cp -a \"$SRC\"/. \"$DST\"/\n"
 		"  done\n"
 		"done\n"
-		"ln -sfn \"$RUNTIME_DIR\" \"$CURRENT\"\n"
 		"cat > \"$MOD/module.prop\" <<'ABK_META_PROP'\n"
 		"id=" ABK_META_MOUNT_ID "\n"
 		"name=" ABK_META_MOUNT_NAME "\n"

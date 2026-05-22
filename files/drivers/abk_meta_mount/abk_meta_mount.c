@@ -38,6 +38,9 @@
 #define ABK_META_MOUNT_WEB_ROOT ABK_META_MOUNT_DATA_DIR "/webroot"
 #define ABK_META_MOUNT_MARKER "/data/adb/metamodule"
 #define ABK_META_MOUNT_HELPER "/system/bin/sh"
+#define ABK_META_MOUNT_RUNTIME_ROOT "/mnt/abk_meta_mount"
+#define ABK_META_MOUNT_STAGE_MODULES_DIR ABK_META_MOUNT_RUNTIME_ROOT "/current/modules"
+#define ABK_META_MOUNT_OVERLAY_DIR ABK_META_MOUNT_RUNTIME_ROOT "/current/overlay"
 
 struct abk_meta_mount_target {
 	char path[64];
@@ -70,9 +73,11 @@ static int abk_meta_mount_ensure_compat_module(void);
 static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target);
 static bool abk_meta_mount_has_unready_targets(void);
 static void abk_meta_mount_schedule_retry(void);
+static bool abk_meta_mount_marker_points_to_module(void);
 
 static bool abk_meta_mount_marker_allows_mount(void)
 {
+	abk_meta_mount_marker_owned = abk_meta_mount_marker_points_to_module();
 	return abk_meta_mount_marker_owned;
 }
 
@@ -168,6 +173,32 @@ static bool abk_meta_mount_path_is_dir(const char *path)
 		return false;
 	path_put(&resolved);
 	return true;
+}
+
+static bool abk_meta_mount_paths_equal(const char *left, const char *right)
+{
+	struct path left_path;
+	struct path right_path;
+	bool equal = false;
+
+	if (kern_path(left, LOOKUP_FOLLOW, &left_path))
+		return false;
+	if (kern_path(right, LOOKUP_FOLLOW, &right_path)) {
+		path_put(&left_path);
+		return false;
+	}
+
+	equal = left_path.mnt == right_path.mnt &&
+		left_path.dentry == right_path.dentry;
+	path_put(&right_path);
+	path_put(&left_path);
+	return equal;
+}
+
+static bool abk_meta_mount_marker_points_to_module(void)
+{
+	return abk_meta_mount_paths_equal(ABK_META_MOUNT_MARKER,
+					  ABK_META_MOUNT_DATA_DIR);
 }
 
 static bool abk_meta_mount_file_contains(const char *path, const char *needle)
@@ -355,6 +386,7 @@ static bool abk_meta_mount_prepare_scan_actor(struct dir_context *ctx, const cha
 		container_of(ctx, struct abk_meta_mount_scan_ctx, ctx);
 	char *module_dir = NULL;
 	char *layer_path = NULL;
+	char *staged_layer_path = NULL;
 	char *marker_path = NULL;
 	char module_name[NAME_MAX + 1];
 	size_t i;
@@ -409,6 +441,19 @@ static bool abk_meta_mount_prepare_scan_actor(struct dir_context *ctx, const cha
 			layer_path = NULL;
 			continue;
 		}
+		staged_layer_path = kasprintf(GFP_KERNEL,
+					      ABK_META_MOUNT_STAGE_MODULES_DIR
+					      "/%s/%s",
+					      module_name, scan->candidates[i]);
+		if (staged_layer_path &&
+		    abk_meta_mount_path_is_dir(staged_layer_path)) {
+			kfree(layer_path);
+			layer_path = staged_layer_path;
+			staged_layer_path = NULL;
+		} else {
+			kfree(staged_layer_path);
+			staged_layer_path = NULL;
+		}
 		ret = abk_meta_mount_lowerdir_prepend(scan->lowerdir,
 						      scan->lowerdir_size,
 						      layer_path);
@@ -424,6 +469,7 @@ static bool abk_meta_mount_prepare_scan_actor(struct dir_context *ctx, const cha
 
 out:
 	kfree(marker_path);
+	kfree(staged_layer_path);
 	kfree(layer_path);
 	kfree(module_dir);
 	return keep_going;
@@ -477,10 +523,10 @@ static int abk_meta_mount_overlay_target(struct abk_meta_mount_target *target,
 	int ret;
 
 	upperdir = kasprintf(GFP_KERNEL,
-			    ABK_META_MOUNT_DATA_DIR "/.runtime/%s/upper",
+			    ABK_META_MOUNT_OVERLAY_DIR "/%s/upper",
 			    target->name);
 	workdir = kasprintf(GFP_KERNEL,
-			   ABK_META_MOUNT_DATA_DIR "/.runtime/%s/work",
+			   ABK_META_MOUNT_OVERLAY_DIR "/%s/work",
 			   target->name);
 	if (!upperdir || !workdir) {
 		ret = -ENOMEM;
@@ -762,8 +808,33 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"MOD='" ABK_META_MOUNT_DATA_DIR "'\n"
 		"WEB='" ABK_META_MOUNT_WEB_ROOT "'\n"
 		"MARK='" ABK_META_MOUNT_MARKER "'\n"
+		"RUNTIME_BASE='" ABK_META_MOUNT_RUNTIME_ROOT "'\n"
+		"CURRENT=\"$RUNTIME_BASE/current\"\n"
+		"RUNTIME_DIR=\"$RUNTIME_BASE/run-$(date +%s)-$$\"\n"
+		"STAGE=\"$RUNTIME_DIR/modules\"\n"
+		"OVERLAY=\"$RUNTIME_DIR/overlay\"\n"
 		"mkdir -p \"$MOD\" \"$WEB\"\n"
 		"rm -f \"$MOD/.marker_owned\"\n"
+		"mkdir -p \"$STAGE\" \"$OVERLAY\"\n"
+		"for CUR in " ABK_META_MOUNT_MODULES_DIR "/*; do\n"
+		"  [ -d \"$CUR\" ] || continue\n"
+		"  MODNAME=${CUR##*/}\n"
+		"  [ \"$MODNAME\" = '" ABK_META_MOUNT_ID "' ] && continue\n"
+		"  [ -f \"$CUR/disable\" ] && continue\n"
+		"  [ -f \"$CUR/remove\" ] && continue\n"
+		"  [ -f \"$CUR/skip_mount\" ] && continue\n"
+		"  if [ -f \"$CUR/module.prop\" ] && grep -Eq '^metamodule=(1|true)$' \"$CUR/module.prop\"; then\n"
+		"    continue\n"
+		"  fi\n"
+		"  for REL in system vendor product system_ext odm oem system/vendor system/product system/system_ext system/odm system/oem; do\n"
+		"    SRC=\"$CUR/$REL\"\n"
+		"    DST=\"$STAGE/$MODNAME/$REL\"\n"
+		"    [ -d \"$SRC\" ] || continue\n"
+		"    mkdir -p \"$DST\"\n"
+		"    cp -a \"$SRC\"/. \"$DST\"/\n"
+		"  done\n"
+		"done\n"
+		"ln -sfn \"$RUNTIME_DIR\" \"$CURRENT\"\n"
 		"cat > \"$MOD/module.prop\" <<'ABK_META_PROP'\n"
 		"id=" ABK_META_MOUNT_ID "\n"
 		"name=" ABK_META_MOUNT_NAME "\n"
@@ -814,8 +885,7 @@ static int abk_meta_mount_ensure_compat_module(void)
 
 	ret = abk_meta_mount_run_shell(script);
 	abk_meta_mount_last_compat_ret = ret;
-	abk_meta_mount_marker_owned =
-		abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/.marker_owned");
+	abk_meta_mount_marker_owned = abk_meta_mount_marker_allows_mount();
 	if (ret)
 		pr_warn("abk_meta_mount: compat module setup failed: %d\n", ret);
 	return ret;
@@ -958,7 +1028,7 @@ static bool abk_meta_mount_has_unready_targets(void)
 
 	mutex_lock(&abk_meta_mount_lock);
 	list_for_each_entry(target, &abk_meta_mount_targets, node) {
-		if (!target->ready) {
+		if (!target->ready && target->last_ret) {
 			unready = true;
 			break;
 		}

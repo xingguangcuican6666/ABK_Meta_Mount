@@ -32,14 +32,15 @@ actual provider is built into the kernel.
 
 ## ABK Usage
 
-Use both stages:
+Use `before_build` at minimum. `after_patch` is optional if you want the source tree copied earlier:
 
 ```text
-https://github.com/your-name/ABK_Meta_Mount.git;after_patch|https://github.com/your-name/ABK_Meta_Mount.git;before_build
+https://github.com/your-name/ABK_Meta_Mount.git;before_build
 ```
 
-`after_patch` installs the source files and Kconfig hooks. `before_build`
-installs them again idempotently and enables the required defconfig symbols.
+`before_build` installs the source files, Kconfig hooks, and required defconfig
+symbols. `after_patch` is optional and only repeats the source copy earlier in
+the build flow.
 
 ## Runtime Behavior
 

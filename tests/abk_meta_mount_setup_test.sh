@@ -96,8 +96,14 @@ assert_contains 'metamodule=1' "$driver"
 assert_contains 'mount=false' "$driver"
 assert_contains 'skip_mount=true' "$driver"
 assert_contains '/sys/kernel/abk_meta_mount/prepare' "$driver"
+assert_contains 'abk_meta_mount_schedule_retry()' "$driver"
 assert_contains 'TAKEOVER=0' "$driver"
 assert_contains '[ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ]' "$driver"
 assert_contains 'ln -sfn \"$MOD\" \"$MARK\"' "$driver"
+
+module_conf="$REPO_ROOT/module.conf"
+assert_contains 'ABK_MODULE_SUPPORTED_STAGES="before_build,after_patch"' "$module_conf"
+assert_contains 'ABK_MODULE_DEFAULT_STAGE="before_build"' "$module_conf"
+assert_contains 'ABK_MODULE_RECOMMENDED_STAGES="before_build"' "$module_conf"
 
 printf 'abk_meta_mount setup test passed\n'

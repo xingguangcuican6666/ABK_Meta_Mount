@@ -54,6 +54,7 @@ static bool abk_meta_mount_registered_control;
 static int abk_meta_mount_run_shell(const char *script);
 static int abk_meta_mount_ensure_compat_module(void);
 static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target);
+static void abk_meta_mount_schedule_retry(void);
 
 static const char * const abk_meta_mount_default_targets[] = {
 	"/system",
@@ -236,10 +237,12 @@ int abk_meta_mount_set_enabled(bool enabled)
 		if (abk_meta_mount_work_initialized)
 			cancel_delayed_work_sync(&abk_meta_mount_work);
 		ret = abk_meta_mount_prepare_all();
-		if (ret == -ENOENT && abk_meta_mount_work_initialized)
-			schedule_delayed_work(&abk_meta_mount_work, 10 * HZ);
-		else if (ret && ret != -ENOENT)
-			pr_warn("abk_meta_mount: enable prepare failed: %d\n", ret);
+		if (ret) {
+			abk_meta_mount_schedule_retry();
+			if (ret != -ENOENT)
+				pr_warn("abk_meta_mount: enable prepare failed: %d\n", ret);
+			ret = 0;
+		}
 	} else {
 		mutex_lock(&abk_meta_mount_lock);
 		list_for_each_entry(target, &abk_meta_mount_targets, node)
@@ -496,8 +499,12 @@ static ssize_t prepare_store(struct kobject *kobj,
 		return ret;
 	if (prepare) {
 		ret = abk_meta_mount_prepare_all();
-		if (ret && ret != -ENOENT)
+		if (ret == -EPERM)
 			return ret;
+		if (ret) {
+			abk_meta_mount_schedule_retry();
+			return count;
+		}
 	}
 	return count;
 }
@@ -603,7 +610,13 @@ static void abk_meta_mount_workfn(struct work_struct *work)
 	(void)work;
 
 	ret = abk_meta_mount_prepare_all();
-	if (ret == -ENOENT)
+	if (ret)
+		abk_meta_mount_schedule_retry();
+}
+
+static void abk_meta_mount_schedule_retry(void)
+{
+	if (abk_meta_mount_work_initialized && abk_meta_mount_is_enabled())
 		schedule_delayed_work(&abk_meta_mount_work, 10 * HZ);
 }
 

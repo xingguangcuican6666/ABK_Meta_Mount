@@ -14,6 +14,9 @@ entry point ABK calls.
 
 ## Stages
 
+`before_build` is the required stage for a working build. `after_patch` is
+optional and only mirrors the source copy earlier in the flow.
+
 ### `after_patch`
 
 - Copy the driver tree into `common/drivers/abk_meta_mount`.

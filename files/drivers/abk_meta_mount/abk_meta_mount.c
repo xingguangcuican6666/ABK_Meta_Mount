@@ -126,6 +126,7 @@ struct abk_meta_mount_scan_ctx {
 	char *lowerdir;
 	size_t lowerdir_size;
 	unsigned int layers;
+	bool stage_root_ready;
 	int ret;
 };
 
@@ -199,6 +200,11 @@ static bool abk_meta_mount_marker_points_to_module(void)
 {
 	return abk_meta_mount_paths_equal(ABK_META_MOUNT_MARKER,
 					  ABK_META_MOUNT_DATA_DIR);
+}
+
+static bool abk_meta_mount_stage_root_ready(void)
+{
+	return abk_meta_mount_path_is_dir(ABK_META_MOUNT_STAGE_MODULES_DIR);
 }
 
 static bool abk_meta_mount_file_contains(const char *path, const char *needle)
@@ -453,6 +459,9 @@ static bool abk_meta_mount_prepare_scan_actor(struct dir_context *ctx, const cha
 		} else {
 			kfree(staged_layer_path);
 			staged_layer_path = NULL;
+			kfree(layer_path);
+			layer_path = NULL;
+			continue;
 		}
 		ret = abk_meta_mount_lowerdir_prepend(scan->lowerdir,
 						      scan->lowerdir_size,
@@ -496,6 +505,9 @@ static int abk_meta_mount_collect_lowerdir(const char *target_path,
 						     fallback);
 	scan.lowerdir = lowerdir;
 	scan.lowerdir_size = lowerdir_size;
+	scan.stage_root_ready = abk_meta_mount_stage_root_ready();
+	if (!scan.stage_root_ready)
+		return -ENOENT;
 
 	dir = filp_open(ABK_META_MOUNT_MODULES_DIR, O_RDONLY | O_DIRECTORY, 0);
 	if (IS_ERR(dir))
@@ -907,6 +919,11 @@ static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 		abk_meta_mount_set_status(target, "other_metamodule");
 		target->last_ret = 0;
 		return 0;
+	}
+	if (!abk_meta_mount_stage_root_ready()) {
+		target->last_ret = -ENOENT;
+		abk_meta_mount_set_status(target, "stage_missing");
+		return -ENOENT;
 	}
 	if (target->ready) {
 		if (abk_meta_mount_is_overlay_mount(target->path)) {

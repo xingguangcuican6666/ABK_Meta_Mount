@@ -440,7 +440,7 @@ static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 		 "  exit 0\n"
 		 "fi\n"
 		 "LOWERS=\"$LOWERS:$T\"\n"
-		 "printf '%s\\n' \"$LOWERS\" > \"$LOWERFILE\"\n"
+		 "printf '%%s\\n' \"$LOWERS\" > \"$LOWERFILE\"\n"
 		 "mkdir -p \"$R/$N/upper\" \"$R/$N/work\"\n"
 		 "if grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1; then\n"
 		 "  printf 'already_overlay\\n' > \"$STATUS\"\n"

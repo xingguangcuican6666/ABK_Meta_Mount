@@ -60,6 +60,11 @@ Disabling through WebUI, ABK Control, or
 overlays. A reboot may still be needed to fully unwind already-mounted
 partitions.
 
+`/proc/abk_meta_mount/status` includes diagnostic fields for the compatibility
+module generator, including whether `/data/adb`, `/system/bin/sh`,
+`action.sh`, and `webroot/index.html` are visible, plus the most recent shell,
+compat-module, and prepare return codes.
+
 ## ABK Control
 
 This repository does not include ABK Control. If the separate ABK Control

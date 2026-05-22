@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kmod.h>
 #include <linux/kobject.h>
@@ -47,6 +48,10 @@ static DEFINE_MUTEX(abk_meta_mount_lock);
 static struct delayed_work abk_meta_mount_work;
 static atomic_t abk_meta_mount_enabled = ATOMIC_INIT(1);
 static bool abk_meta_mount_work_initialized;
+static int abk_meta_mount_last_shell_ret;
+static int abk_meta_mount_last_compat_ret;
+static int abk_meta_mount_last_prepare_ret;
+static unsigned long abk_meta_mount_last_compat_jiffies;
 #if IS_ENABLED(CONFIG_ABK_CONTROL)
 static bool abk_meta_mount_registered_control;
 #endif
@@ -200,9 +205,6 @@ bool abk_meta_mount_is_enabled(void)
 
 	disabled = abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/disable") ||
 		   abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/remove");
-	if (!disabled && !atomic_read(&abk_meta_mount_enabled))
-		atomic_set(&abk_meta_mount_enabled, 1);
-
 	return !disabled && atomic_read(&abk_meta_mount_enabled) != 0;
 }
 EXPORT_SYMBOL_GPL(abk_meta_mount_is_enabled);
@@ -288,12 +290,15 @@ static int abk_meta_mount_run_shell(const char *script)
 	int ret;
 
 	if (!abk_meta_mount_path_exists(ABK_META_MOUNT_HELPER))
-		return -ENOENT;
+		return abk_meta_mount_last_shell_ret = -ENOENT;
 
 	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-	if (ret < 0)
+	if (ret < 0) {
+		abk_meta_mount_last_shell_ret = ret;
 		return ret;
-	return ret ? -EIO : 0;
+	}
+	abk_meta_mount_last_shell_ret = ret ? -EIO : 0;
+	return abk_meta_mount_last_shell_ret;
 }
 
 static int abk_meta_mount_ensure_compat_module(void)
@@ -320,6 +325,7 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"ABK_META_PROP\n"
 		"cat > \"$MOD/metamount.sh\" <<'ABK_META_METAMOUNT'\n"
 		"#!/system/bin/sh\n"
+		"rm -f /data/adb/modules/meta-abk-mount/disable /data/adb/modules/meta-abk-mount/remove\n"
 		"echo 1 > /sys/kernel/abk_meta_mount/enabled 2>/dev/null || true\n"
 		"echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true\n"
 		"ABK_META_METAMOUNT\n"
@@ -330,7 +336,7 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"ABK_META_ACTION\n"
 		"chmod 755 \"$MOD/action.sh\"\n"
 		"cat > \"$WEB/index.html\" <<'ABK_META_WEB'\n"
-		"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ABK Meta Mount</title><style>body{font-family:system-ui,sans-serif;margin:20px;line-height:1.45;color:#171717;background:#f7f7f4}main{max-width:760px}button{padding:10px 14px;margin:0 8px 10px 0;border:1px solid #888;background:#fff;border-radius:6px}pre{white-space:pre-wrap;background:#101820;color:#eef5f5;padding:12px;border-radius:6px;min-height:180px;overflow:auto}</style></head><body><main><h1>ABK Meta Mount</h1><p>Built-in KernelSU metamodule provider. Disable is persistent; already-mounted overlays may require reboot to fully unwind.</p><button onclick=\"refresh()\">Refresh</button><button onclick=\"setEnabled(1)\">Enable</button><button onclick=\"setEnabled(0)\">Disable</button><pre id=\"out\">Loading...</pre></main><script>function out(v){document.getElementById('out').textContent=v}function sh(c){try{if(window.ksu&&typeof window.ksu.exec==='function'){return window.ksu.exec(c)}return 'KernelSU WebUI exec API unavailable'}catch(e){return String(e)}}function refresh(){out(sh('cat /proc/abk_meta_mount/status 2>/dev/null || echo unavailable'))}function setEnabled(v){var c='echo '+v+' > /sys/kernel/abk_meta_mount/enabled';if(v==1)c=c+'; echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true';out(sh(c+'; cat /proc/abk_meta_mount/status 2>/dev/null || true'))}refresh()</script></body></html>\n"
+		"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ABK Meta Mount</title><style>body{font-family:system-ui,sans-serif;margin:20px;line-height:1.45;color:#171717;background:#f7f7f4}main{max-width:760px}button{padding:10px 14px;margin:0 8px 10px 0;border:1px solid #888;background:#fff;border-radius:6px}pre{white-space:pre-wrap;background:#101820;color:#eef5f5;padding:12px;border-radius:6px;min-height:180px;overflow:auto}</style></head><body><main><h1>ABK Meta Mount</h1><p>Built-in KernelSU metamodule provider. Disable is persistent; already-mounted overlays may require reboot to fully unwind.</p><button onclick=\"refresh()\">Refresh</button><button onclick=\"setEnabled(1)\">Enable</button><button onclick=\"setEnabled(0)\">Disable</button><pre id=\"out\">Loading...</pre></main><script>function out(v){document.getElementById('out').textContent=v}function sh(c){try{if(window.ksu&&typeof window.ksu.exec==='function'){return window.ksu.exec(c)}return 'KernelSU WebUI exec API unavailable'}catch(e){return String(e)}}function refresh(){out(sh('cat /proc/abk_meta_mount/status 2>/dev/null || echo unavailable'))}function setEnabled(v){var c;if(v==1){c='rm -f /data/adb/modules/meta-abk-mount/disable /data/adb/modules/meta-abk-mount/remove; echo 1 > /sys/kernel/abk_meta_mount/enabled; echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true'}else{c='mkdir -p /data/adb/modules/meta-abk-mount; touch /data/adb/modules/meta-abk-mount/disable; echo 0 > /sys/kernel/abk_meta_mount/enabled'}out(sh(c+'; cat /proc/abk_meta_mount/status 2>/dev/null || true'))}refresh()</script></body></html>\n"
 		"ABK_META_WEB\n"
 		"if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then exit 0; fi\n"
 		"TAKEOVER=0\n"
@@ -347,10 +353,12 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"[ \"$TAKEOVER\" = 1 ] && ln -sfn \"$MOD\" \"$MARK\"\n";
 	int ret;
 
+	abk_meta_mount_last_compat_jiffies = jiffies;
 	if (!abk_meta_mount_path_exists("/data/adb"))
-		return -ENOENT;
+		return abk_meta_mount_last_compat_ret = -ENOENT;
 
 	ret = abk_meta_mount_run_shell(script);
+	abk_meta_mount_last_compat_ret = ret;
 	if (ret)
 		pr_warn("abk_meta_mount: compat module setup failed: %d\n", ret);
 	return ret;
@@ -435,8 +443,10 @@ int abk_meta_mount_prepare_all(void)
 	int compat_ret;
 	int ret = 0;
 
-	if (!abk_meta_mount_is_enabled())
+	if (!abk_meta_mount_is_enabled()) {
+		abk_meta_mount_last_prepare_ret = -EPERM;
 		return -EPERM;
+	}
 
 	compat_ret = abk_meta_mount_ensure_compat_module();
 	if (compat_ret)
@@ -452,6 +462,7 @@ int abk_meta_mount_prepare_all(void)
 	}
 	mutex_unlock(&abk_meta_mount_lock);
 
+	abk_meta_mount_last_prepare_ret = ret;
 	return ret;
 }
 EXPORT_SYMBOL_GPL(abk_meta_mount_prepare_all);
@@ -528,7 +539,28 @@ static int abk_meta_mount_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "name=%s\n", ABK_META_MOUNT_NAME);
 	seq_printf(m, "version=%s\n", ABK_META_MOUNT_VERSION);
 	seq_printf(m, "enabled=%d\n", abk_meta_mount_is_enabled() ? 1 : 0);
+	seq_printf(m, "atomic_enabled=%d\n", atomic_read(&abk_meta_mount_enabled));
 	seq_printf(m, "metamodule=1\n");
+	seq_printf(m, "path_data_adb=%d\n",
+		   abk_meta_mount_path_exists("/data/adb") ? 1 : 0);
+	seq_printf(m, "path_helper=%d\n",
+		   abk_meta_mount_path_exists(ABK_META_MOUNT_HELPER) ? 1 : 0);
+	seq_printf(m, "path_module_dir=%d\n",
+		   abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR) ? 1 : 0);
+	seq_printf(m, "path_action=%d\n",
+		   abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/action.sh") ? 1 : 0);
+	seq_printf(m, "path_web_index=%d\n",
+		   abk_meta_mount_path_exists(ABK_META_MOUNT_WEB_ROOT "/index.html") ? 1 : 0);
+	seq_printf(m, "disabled_marker=%d\n",
+		   abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/disable") ? 1 : 0);
+	seq_printf(m, "remove_marker=%d\n",
+		   abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/remove") ? 1 : 0);
+	seq_printf(m, "last_shell_ret=%d\n", abk_meta_mount_last_shell_ret);
+	seq_printf(m, "last_compat_ret=%d\n", abk_meta_mount_last_compat_ret);
+	seq_printf(m, "last_prepare_ret=%d\n", abk_meta_mount_last_prepare_ret);
+	seq_printf(m, "last_compat_age_ms=%u\n",
+		   abk_meta_mount_last_compat_jiffies ?
+		   jiffies_to_msecs(jiffies - abk_meta_mount_last_compat_jiffies) : 0);
 
 	mutex_lock(&abk_meta_mount_lock);
 	list_for_each_entry(target, &abk_meta_mount_targets, node)

@@ -5,6 +5,7 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
+#include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -481,6 +482,7 @@ static int abk_meta_mount_overlay_target(struct abk_meta_mount_target *target,
 	char *upperdir;
 	char *workdir;
 	char *data;
+	int len;
 	int ret;
 
 	upperdir = kasprintf(GFP_KERNEL,
@@ -501,11 +503,16 @@ static int abk_meta_mount_overlay_target(struct abk_meta_mount_target *target,
 	if (ret)
 		goto out_free_paths;
 
-	data = kasprintf(GFP_KERNEL, "lowerdir=%s,upperdir=%s,workdir=%s",
-			 lowerdir, upperdir, workdir);
+	data = (char *)__get_free_page(GFP_KERNEL);
 	if (!data) {
 		ret = -ENOMEM;
 		goto out_free_paths;
+	}
+	len = scnprintf(data, PAGE_SIZE, "lowerdir=%s,upperdir=%s,workdir=%s",
+			lowerdir, upperdir, workdir);
+	if (len >= PAGE_SIZE) {
+		ret = -ENAMETOOLONG;
+		goto out_free_data;
 	}
 
 	ret = kern_path(target->path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
@@ -515,7 +522,7 @@ static int abk_meta_mount_overlay_target(struct abk_meta_mount_target *target,
 	path_put(&path);
 
 out_free_data:
-	kfree(data);
+	free_page((unsigned long)data);
 out_free_paths:
 	kfree(workdir);
 	kfree(upperdir);

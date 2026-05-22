@@ -531,7 +531,6 @@ static int abk_meta_mount_umount_target(struct abk_meta_mount_target *target)
 	if (ret)
 		return ret;
 	ret = path_umount(&path, 0);
-	path_put(&path);
 	return ret;
 }
 

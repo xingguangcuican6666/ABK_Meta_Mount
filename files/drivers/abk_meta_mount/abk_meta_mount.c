@@ -170,15 +170,6 @@ static bool abk_meta_mount_path_is_dir(const char *path)
 	return true;
 }
 
-static int abk_meta_mount_join_path(char *buf, size_t buf_size, const char *left,
-				    const char *right)
-{
-	int len;
-
-	len = scnprintf(buf, buf_size, "%s/%s", left, right);
-	return len >= buf_size ? -ENAMETOOLONG : 0;
-}
-
 static bool abk_meta_mount_file_contains(const char *path, const char *needle)
 {
 	struct file *file;

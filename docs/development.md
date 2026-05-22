@@ -22,6 +22,8 @@ optional and only mirrors the source copy earlier in the flow.
 - Copy the driver tree into `common/drivers/abk_meta_mount`.
 - Copy the public header into `common/include/linux/abk_meta_mount.h`.
 - Append the Kconfig and Makefile hooks once.
+- Patch `common/fs/namespace.c` once so `path_mount()` and `path_umount()` are
+  callable by the built-in ABK Meta Mount driver.
 
 ### `before_build`
 
@@ -41,6 +43,9 @@ optional and only mirrors the source copy earlier in the flow.
   so KernelSU and ABK can discover a metamodule entry.
 - It takes over `/data/adb/metamodule` only when the existing target is absent,
   missing, disabled, removed, or already points to `meta-abk-mount`.
+- It scans ordinary module directories and executes OverlayFS mounts in the
+  kernel with `path_mount()`. Shell is kept only for compatibility module file
+  generation.
 - It exposes runtime control through sysfs and procfs.
 - It optionally registers with ABK Control only when `CONFIG_ABK_CONTROL` is
   enabled in the kernel tree.

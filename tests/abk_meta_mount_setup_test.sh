@@ -8,10 +8,23 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 KERNEL_ROOT="$TMP_DIR/kernel"
 DEFCONFIG="$TMP_DIR/gki_defconfig"
 
-mkdir -p "$KERNEL_ROOT/common/drivers" "$KERNEL_ROOT/common/include/linux"
+mkdir -p "$KERNEL_ROOT/common/drivers" "$KERNEL_ROOT/common/include/linux" "$KERNEL_ROOT/common/fs"
 printf 'VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 0\n' > "$KERNEL_ROOT/common/Makefile"
 printf 'menu "Device Drivers"\nendmenu\n' > "$KERNEL_ROOT/common/drivers/Kconfig"
 printf '# drivers makefile\n' > "$KERNEL_ROOT/common/drivers/Makefile"
+cat > "$KERNEL_ROOT/common/fs/namespace.c" <<'EOF_NAMESPACE'
+static int path_mount(const char *dev_name, struct path *path,
+                      const char *type_page, unsigned long flags,
+                      void *data_page)
+{
+        return 0;
+}
+
+static int path_umount(struct path *path, int flags)
+{
+        return 0;
+}
+EOF_NAMESPACE
 printf '# defconfig\n' > "$DEFCONFIG"
 
 run_stage() {
@@ -74,6 +87,12 @@ assert_count 1 'source "drivers/abk_meta_mount/Kconfig"' \
   "$KERNEL_ROOT/common/drivers/Kconfig"
 assert_count 1 'obj-$(CONFIG_ABK_META_MOUNT) += abk_meta_mount/' \
   "$KERNEL_ROOT/common/drivers/Makefile"
+assert_count 1 'int path_mount(const char *dev_name, struct path *path,' \
+  "$KERNEL_ROOT/common/fs/namespace.c"
+assert_count 1 'int path_umount(struct path *path, int flags)' \
+  "$KERNEL_ROOT/common/fs/namespace.c"
+assert_count 1 '/* ABK Meta Mount: expose in-kernel mount helpers to the built-in provider. */' \
+  "$KERNEL_ROOT/common/fs/namespace.c"
 
 for symbol in \
   CONFIG_ABK_META_MOUNT \
@@ -97,9 +116,16 @@ assert_contains 'mount=false' "$driver"
 assert_contains 'skip_mount=true' "$driver"
 assert_contains '/sys/kernel/abk_meta_mount/prepare' "$driver"
 assert_contains 'abk_meta_mount_schedule_retry()' "$driver"
+assert_contains 'path_mount("KSU", &path, "overlay", 0, data)' "$driver"
+assert_contains 'abk_meta_mount_collect_lowerdir(target->path' "$driver"
+assert_contains 'status=%s lowerdir=%s' "$driver"
 assert_contains 'TAKEOVER=0' "$driver"
 assert_contains '[ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ]' "$driver"
-assert_contains 'ln -sfn \"$MOD\" \"$MARK\"' "$driver"
+assert_contains 'touch \"$MOD/.marker_owned\"' "$driver"
+if grep -Fq 'mount -t overlay' "$driver"; then
+  printf 'driver still contains shell overlay mount\n' >&2
+  exit 1
+fi
 
 module_conf="$REPO_ROOT/module.conf"
 assert_contains 'ABK_MODULE_SUPPORTED_STAGES="before_build,after_patch"' "$module_conf"

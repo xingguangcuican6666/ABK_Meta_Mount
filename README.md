@@ -14,6 +14,8 @@ actual provider is built into the kernel.
 - Copies `drivers/abk_meta_mount` and `include/linux/abk_meta_mount.h` into the
   ABK kernel tree.
 - Adds `CONFIG_ABK_META_MOUNT` to `common/drivers/Kconfig` and `Makefile`.
+- Makes `path_mount()` and `path_umount()` visible inside `fs/namespace.c` so
+  the built-in provider can call the same VFS mount path as the kernel.
 - Enables OverlayFS, tmpfs, tmpfs xattrs, tmpfs POSIX ACLs, and procfs during
   the `before_build` stage.
 - Creates a KernelSU-compatible module directory containing:
@@ -26,7 +28,8 @@ actual provider is built into the kernel.
   - `/sys/kernel/abk_meta_mount/prepare`
   - `/proc/abk_meta_mount/status`
 - Mounts enabled ordinary module layers over `/system`, `/vendor`, `/product`,
-  `/system_ext`, `/odm`, and `/oem` with OverlayFS.
+  `/system_ext`, `/odm`, and `/oem` with OverlayFS through in-kernel
+  `path_mount()`. The shell helper is no longer used for target mounts.
 - Optionally registers with ABK Control through `abk_control_register()` only
   when `CONFIG_ABK_CONTROL` is enabled.
 
@@ -45,7 +48,7 @@ the build flow.
 ## Runtime Behavior
 
 On boot, the driver waits until `/data/adb` and `/system/bin/sh` are available.
-It then writes the compatibility module files and creates
+It uses the shell helper only to write the compatibility module files and create
 `/data/adb/metamodule -> /data/adb/modules/meta-abk-mount` if that marker is
 absent, already points to this module, points to a missing module, or points to
 a module with `disable` or `remove`.
@@ -60,12 +63,16 @@ Disabling through WebUI, ABK Control, or
 overlays. A reboot may still be needed to fully unwind already-mounted
 partitions.
 
+Target preparation scans `/data/adb/modules` in the kernel, skips disabled,
+removed, `skip_mount`, and metamodule directories, then builds an OverlayFS
+lowerdir list from matching partition folders such as `system`, `vendor`, and
+`system/vendor`.
+
 `/proc/abk_meta_mount/status` includes diagnostic fields for the compatibility
 module generator, including whether `/data/adb`, `/system/bin/sh`,
 `action.sh`, and `webroot/index.html` are visible, plus the most recent shell,
-compat-module, and prepare return codes.
-Each target line also reports its last status file and the resolved lowerdir
-list that was used for the mount attempt.
+compat-module, and prepare return codes. Each target line reports the in-memory
+status and resolved lowerdir used for the in-kernel mount attempt.
 
 ## ABK Control
 

@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 #include <linux/kmod.h>
 #include <linux/kobject.h>
 #include <linux/list.h>
@@ -20,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #if IS_ENABLED(CONFIG_ABK_CONTROL)
@@ -30,7 +32,7 @@
 #define ABK_META_MOUNT_VERSION "0.1.0"
 #define ABK_META_MOUNT_AUTHOR "ABK"
 #define ABK_META_MOUNT_DESC "Built-in KernelSU-compatible metamodule provider"
-#define ABK_META_MOUNT_ROOT "/dev/abk_meta_mount"
+#define ABK_META_MOUNT_MODULES_DIR "/data/adb/modules"
 #define ABK_META_MOUNT_DATA_DIR "/data/adb/modules/" ABK_META_MOUNT_ID
 #define ABK_META_MOUNT_WEB_ROOT ABK_META_MOUNT_DATA_DIR "/webroot"
 #define ABK_META_MOUNT_MARKER "/data/adb/metamodule"
@@ -39,6 +41,8 @@
 struct abk_meta_mount_target {
 	char path[64];
 	char name[32];
+	char last_status[64];
+	char *last_lowerdir;
 	unsigned long flags;
 	bool ready;
 	int last_ret;
@@ -55,6 +59,7 @@ static int abk_meta_mount_last_shell_ret;
 static int abk_meta_mount_last_compat_ret;
 static int abk_meta_mount_last_prepare_ret;
 static unsigned long abk_meta_mount_last_compat_jiffies;
+static bool abk_meta_mount_marker_owned;
 #if IS_ENABLED(CONFIG_ABK_CONTROL)
 static bool abk_meta_mount_registered_control;
 #endif
@@ -65,6 +70,11 @@ static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target);
 static bool abk_meta_mount_has_unready_targets(void);
 static void abk_meta_mount_schedule_retry(void);
 
+static bool abk_meta_mount_marker_allows_mount(void)
+{
+	return abk_meta_mount_marker_owned;
+}
+
 static const char * const abk_meta_mount_default_targets[] = {
 	"/system",
 	"/vendor",
@@ -73,6 +83,67 @@ static const char * const abk_meta_mount_default_targets[] = {
 	"/odm",
 	"/oem",
 };
+
+static const char * const abk_meta_mount_system_candidates[] = {
+	"system",
+};
+
+static const char * const abk_meta_mount_vendor_candidates[] = {
+	"vendor",
+	"system/vendor",
+};
+
+static const char * const abk_meta_mount_product_candidates[] = {
+	"product",
+	"system/product",
+};
+
+static const char * const abk_meta_mount_system_ext_candidates[] = {
+	"system_ext",
+	"system/system_ext",
+};
+
+static const char * const abk_meta_mount_odm_candidates[] = {
+	"odm",
+	"system/odm",
+};
+
+static const char * const abk_meta_mount_oem_candidates[] = {
+	"oem",
+	"system/oem",
+};
+
+struct abk_meta_mount_scan_ctx {
+	struct dir_context ctx;
+	const char * const *candidates;
+	size_t candidate_count;
+	char *lowerdir;
+	size_t lowerdir_size;
+	unsigned int layers;
+	int ret;
+};
+
+static void abk_meta_mount_set_status(struct abk_meta_mount_target *target,
+				      const char *status)
+{
+	strscpy(target->last_status, status ?: "-", sizeof(target->last_status));
+}
+
+static int abk_meta_mount_set_lowerdir(struct abk_meta_mount_target *target,
+				       const char *lowerdir)
+{
+	char *copy = NULL;
+
+	if (lowerdir && lowerdir[0]) {
+		copy = kstrdup(lowerdir, GFP_KERNEL);
+		if (!copy)
+			return -ENOMEM;
+	}
+
+	kfree(target->last_lowerdir);
+	target->last_lowerdir = copy;
+	return 0;
+}
 
 static bool abk_meta_mount_path_exists(const char *path)
 {
@@ -84,6 +155,384 @@ static bool abk_meta_mount_path_exists(const char *path)
 		return false;
 	path_put(&resolved);
 	return true;
+}
+
+static bool abk_meta_mount_path_is_dir(const char *path)
+{
+	struct path resolved;
+	int ret;
+
+	ret = kern_path(path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &resolved);
+	if (ret)
+		return false;
+	path_put(&resolved);
+	return true;
+}
+
+static int abk_meta_mount_join_path(char *buf, size_t buf_size, const char *left,
+				    const char *right)
+{
+	int len;
+
+	len = scnprintf(buf, buf_size, "%s/%s", left, right);
+	return len >= buf_size ? -ENAMETOOLONG : 0;
+}
+
+static bool abk_meta_mount_file_contains(const char *path, const char *needle)
+{
+	struct file *file;
+	loff_t pos = 0;
+	char buf[512];
+	ssize_t len;
+	bool found = false;
+
+	file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return false;
+
+	len = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+	filp_close(file, NULL);
+	if (len <= 0)
+		return false;
+
+	buf[len] = '\0';
+	found = !!strnstr(buf, needle, len);
+	return found;
+}
+
+static bool abk_meta_mount_is_metamodule_dir(const char *module_dir)
+{
+	char *prop_path;
+	bool ret;
+
+	prop_path = kasprintf(GFP_KERNEL, "%s/module.prop", module_dir);
+	if (!prop_path)
+		return false;
+
+	ret = abk_meta_mount_file_contains(prop_path, "metamodule=1") ||
+	      abk_meta_mount_file_contains(prop_path, "metamodule=true");
+	kfree(prop_path);
+	return ret;
+}
+
+static int abk_meta_mount_mkdir_one(const char *path, umode_t mode)
+{
+	struct path parent;
+	struct dentry *dentry;
+	int ret;
+
+	if (abk_meta_mount_path_is_dir(path))
+		return 0;
+
+	dentry = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	ret = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
+#else
+	ret = vfs_mkdir(mnt_user_ns(parent.mnt), d_inode(parent.dentry), dentry, mode);
+#endif
+	done_path_create(&parent, dentry);
+	return ret == -EEXIST ? 0 : ret;
+}
+
+static int abk_meta_mount_mkdir_p(const char *path, umode_t mode)
+{
+	char *copy;
+	char *cursor;
+	int ret = 0;
+
+	if (!path || path[0] != '/')
+		return -EINVAL;
+
+	copy = kstrdup(path, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+
+	for (cursor = copy + 1; ; cursor++) {
+		if (*cursor != '/' && *cursor != '\0')
+			continue;
+
+		if (cursor != copy + 1) {
+			char saved = *cursor;
+
+			*cursor = '\0';
+			ret = abk_meta_mount_mkdir_one(copy, mode);
+			*cursor = saved;
+			if (ret)
+				break;
+		}
+
+		if (*cursor == '\0')
+			break;
+	}
+
+	kfree(copy);
+	return ret;
+}
+
+static const char * const *abk_meta_mount_candidates_for(const char *path,
+							 size_t *count,
+							 const char **fallback)
+{
+	if (!strcmp(path, "/system")) {
+		*count = ARRAY_SIZE(abk_meta_mount_system_candidates);
+		return abk_meta_mount_system_candidates;
+	}
+	if (!strcmp(path, "/vendor")) {
+		*count = ARRAY_SIZE(abk_meta_mount_vendor_candidates);
+		return abk_meta_mount_vendor_candidates;
+	}
+	if (!strcmp(path, "/product")) {
+		*count = ARRAY_SIZE(abk_meta_mount_product_candidates);
+		return abk_meta_mount_product_candidates;
+	}
+	if (!strcmp(path, "/system_ext")) {
+		*count = ARRAY_SIZE(abk_meta_mount_system_ext_candidates);
+		return abk_meta_mount_system_ext_candidates;
+	}
+	if (!strcmp(path, "/odm")) {
+		*count = ARRAY_SIZE(abk_meta_mount_odm_candidates);
+		return abk_meta_mount_odm_candidates;
+	}
+	if (!strcmp(path, "/oem")) {
+		*count = ARRAY_SIZE(abk_meta_mount_oem_candidates);
+		return abk_meta_mount_oem_candidates;
+	}
+
+	fallback[0] = path[0] == '/' ? path + 1 : path;
+	*count = 1;
+	return fallback;
+}
+
+static int abk_meta_mount_lowerdir_prepend(char *lowerdir, size_t lowerdir_size,
+					   const char *path)
+{
+	size_t lower_len;
+	size_t path_len;
+
+	if (!path || !path[0])
+		return 0;
+
+	lower_len = strlen(lowerdir);
+	path_len = strlen(path);
+	if (!lower_len) {
+		if (path_len + 1 > lowerdir_size)
+			return -ENAMETOOLONG;
+		memcpy(lowerdir, path, path_len + 1);
+		return 0;
+	}
+	if (path_len + 1 + lower_len + 1 > lowerdir_size)
+		return -ENAMETOOLONG;
+	memmove(lowerdir + path_len + 1, lowerdir, lower_len + 1);
+	memcpy(lowerdir, path, path_len);
+	lowerdir[path_len] = ':';
+	return 0;
+}
+
+static int abk_meta_mount_lowerdir_append(char *lowerdir, size_t lowerdir_size,
+					  const char *path)
+{
+	size_t lower_len;
+	size_t path_len;
+
+	if (!path || !path[0])
+		return 0;
+
+	lower_len = strlen(lowerdir);
+	path_len = strlen(path);
+	if (!lower_len) {
+		if (path_len + 1 > lowerdir_size)
+			return -ENAMETOOLONG;
+		memcpy(lowerdir, path, path_len + 1);
+		return 0;
+	}
+	if (lower_len + 1 + path_len + 1 > lowerdir_size)
+		return -ENAMETOOLONG;
+	lowerdir[lower_len] = ':';
+	memcpy(lowerdir + lower_len + 1, path, path_len + 1);
+	return 0;
+}
+
+static bool abk_meta_mount_prepare_scan_actor(struct dir_context *ctx, const char *name,
+					      int namelen, loff_t offset, u64 ino,
+					      unsigned int d_type)
+{
+	struct abk_meta_mount_scan_ctx *scan =
+		container_of(ctx, struct abk_meta_mount_scan_ctx, ctx);
+	char *module_dir = NULL;
+	char *layer_path = NULL;
+	char *marker_path = NULL;
+	char module_name[NAME_MAX + 1];
+	size_t i;
+	bool keep_going = true;
+	int ret = 0;
+
+	(void)offset;
+	(void)ino;
+	(void)d_type;
+
+	if (scan->ret)
+		return false;
+	if (namelen <= 0 || namelen > NAME_MAX)
+		return true;
+	if (name[0] == '.' && (namelen == 1 || (namelen == 2 && name[1] == '.')))
+		return true;
+
+	memcpy(module_name, name, namelen);
+	module_name[namelen] = '\0';
+
+	if (!strcmp(module_name, ABK_META_MOUNT_ID))
+		return true;
+
+	module_dir = kasprintf(GFP_KERNEL, ABK_META_MOUNT_MODULES_DIR "/%s",
+			      module_name);
+	if (!module_dir)
+		return true;
+	if (!abk_meta_mount_path_is_dir(module_dir))
+		goto out;
+
+	marker_path = kasprintf(GFP_KERNEL, "%s/disable", module_dir);
+	if (marker_path && abk_meta_mount_path_exists(marker_path))
+		goto out;
+	kfree(marker_path);
+	marker_path = kasprintf(GFP_KERNEL, "%s/remove", module_dir);
+	if (marker_path && abk_meta_mount_path_exists(marker_path))
+		goto out;
+	kfree(marker_path);
+	marker_path = kasprintf(GFP_KERNEL, "%s/skip_mount", module_dir);
+	if (marker_path && abk_meta_mount_path_exists(marker_path))
+		goto out;
+	if (abk_meta_mount_is_metamodule_dir(module_dir))
+		goto out;
+
+	for (i = 0; i < scan->candidate_count; i++) {
+		layer_path = kasprintf(GFP_KERNEL, "%s/%s", module_dir,
+				       scan->candidates[i]);
+		if (!layer_path)
+			continue;
+		if (!abk_meta_mount_path_is_dir(layer_path)) {
+			kfree(layer_path);
+			layer_path = NULL;
+			continue;
+		}
+		ret = abk_meta_mount_lowerdir_prepend(scan->lowerdir,
+						      scan->lowerdir_size,
+						      layer_path);
+		kfree(layer_path);
+		layer_path = NULL;
+		if (ret) {
+			scan->ret = ret;
+			keep_going = false;
+			goto out;
+		}
+		scan->layers++;
+	}
+
+out:
+	kfree(marker_path);
+	kfree(layer_path);
+	kfree(module_dir);
+	return keep_going;
+}
+
+static int abk_meta_mount_collect_lowerdir(const char *target_path,
+					   char *lowerdir, size_t lowerdir_size,
+					   unsigned int *layers)
+{
+	struct abk_meta_mount_scan_ctx scan;
+	struct file *dir;
+	const char *fallback[1] = { NULL };
+	int ret;
+
+	if (!lowerdir || !lowerdir_size || !layers)
+		return -EINVAL;
+
+	lowerdir[0] = '\0';
+	*layers = 0;
+	memset(&scan, 0, sizeof(scan));
+	scan.ctx.actor = abk_meta_mount_prepare_scan_actor;
+	scan.candidates = abk_meta_mount_candidates_for(target_path,
+						     &scan.candidate_count,
+						     fallback);
+	scan.lowerdir = lowerdir;
+	scan.lowerdir_size = lowerdir_size;
+
+	dir = filp_open(ABK_META_MOUNT_MODULES_DIR, O_RDONLY | O_DIRECTORY, 0);
+	if (IS_ERR(dir))
+		return PTR_ERR(dir);
+
+	ret = iterate_dir(dir, &scan.ctx);
+	filp_close(dir, NULL);
+	if (ret)
+		return ret;
+	if (scan.ret)
+		return scan.ret;
+
+	*layers = scan.layers;
+	return 0;
+}
+
+static int abk_meta_mount_overlay_target(struct abk_meta_mount_target *target,
+					 const char *lowerdir)
+{
+	struct path path;
+	char *upperdir;
+	char *workdir;
+	char *data;
+	int ret;
+
+	upperdir = kasprintf(GFP_KERNEL,
+			    ABK_META_MOUNT_DATA_DIR "/.runtime/%s/upper",
+			    target->name);
+	workdir = kasprintf(GFP_KERNEL,
+			   ABK_META_MOUNT_DATA_DIR "/.runtime/%s/work",
+			   target->name);
+	if (!upperdir || !workdir) {
+		ret = -ENOMEM;
+		goto out_free_paths;
+	}
+
+	ret = abk_meta_mount_mkdir_p(upperdir, 0755);
+	if (ret)
+		goto out_free_paths;
+	ret = abk_meta_mount_mkdir_p(workdir, 0755);
+	if (ret)
+		goto out_free_paths;
+
+	data = kasprintf(GFP_KERNEL, "lowerdir=%s,upperdir=%s,workdir=%s",
+			 lowerdir, upperdir, workdir);
+	if (!data) {
+		ret = -ENOMEM;
+		goto out_free_paths;
+	}
+
+	ret = kern_path(target->path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
+	if (ret)
+		goto out_free_data;
+	ret = path_mount("KSU", &path, "overlay", 0, data);
+	path_put(&path);
+
+out_free_data:
+	kfree(data);
+out_free_paths:
+	kfree(workdir);
+	kfree(upperdir);
+	return ret;
+}
+
+static int abk_meta_mount_umount_target(struct abk_meta_mount_target *target)
+{
+	struct path path;
+	int ret;
+
+	ret = kern_path(target->path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
+	if (ret)
+		return ret;
+	ret = path_umount(&path, 0);
+	path_put(&path);
+	return ret;
 }
 
 static bool abk_meta_mount_is_overlay_mount(const char *path)
@@ -233,8 +682,7 @@ int abk_meta_mount_set_enabled(bool enabled)
 		"MOD='" ABK_META_MOUNT_DATA_DIR "'\n"
 		"mkdir -p \"$MOD\"\n"
 		"touch \"$MOD/disable\"\n"
-		"rm -f \"$MOD/remove\"\n"
-		"for p in /system /vendor /product /system_ext /odm /oem; do umount \"$p\" 2>/dev/null || true; done\n";
+		"rm -f \"$MOD/remove\"\n";
 
 	atomic_set(&abk_meta_mount_enabled, enabled ? 1 : 0);
 	if (!enabled && abk_meta_mount_work_initialized)
@@ -252,8 +700,12 @@ int abk_meta_mount_set_enabled(bool enabled)
 		}
 	} else {
 		mutex_lock(&abk_meta_mount_lock);
-		list_for_each_entry(target, &abk_meta_mount_targets, node)
+		list_for_each_entry(target, &abk_meta_mount_targets, node) {
+			if (target->ready || abk_meta_mount_is_overlay_mount(target->path))
+				abk_meta_mount_umount_target(target);
 			target->ready = false;
+			abk_meta_mount_set_status(target, "disabled");
+		}
 		mutex_unlock(&abk_meta_mount_lock);
 	}
 	pr_info("abk_meta_mount: %s\n", enabled ? "enabled" : "disabled");
@@ -314,6 +766,7 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"WEB='" ABK_META_MOUNT_WEB_ROOT "'\n"
 		"MARK='" ABK_META_MOUNT_MARKER "'\n"
 		"mkdir -p \"$MOD\" \"$WEB\"\n"
+		"rm -f \"$MOD/.marker_owned\"\n"
 		"cat > \"$MOD/module.prop\" <<'ABK_META_PROP'\n"
 		"id=" ABK_META_MOUNT_ID "\n"
 		"name=" ABK_META_MOUNT_NAME "\n"
@@ -355,7 +808,7 @@ static int abk_meta_mount_ensure_compat_module(void)
 		"    TAKEOVER=1\n"
 		"  fi\n"
 		"fi\n"
-		"[ \"$TAKEOVER\" = 1 ] && ln -sfn \"$MOD\" \"$MARK\"\n";
+		"if [ \"$TAKEOVER\" = 1 ]; then ln -sfn \"$MOD\" \"$MARK\" && touch \"$MOD/.marker_owned\"; fi\n";
 	int ret;
 
 	abk_meta_mount_last_compat_jiffies = jiffies;
@@ -364,6 +817,8 @@ static int abk_meta_mount_ensure_compat_module(void)
 
 	ret = abk_meta_mount_run_shell(script);
 	abk_meta_mount_last_compat_ret = ret;
+	abk_meta_mount_marker_owned =
+		abk_meta_mount_path_exists(ABK_META_MOUNT_DATA_DIR "/.marker_owned");
 	if (ret)
 		pr_warn("abk_meta_mount: compat module setup failed: %d\n", ret);
 	return ret;
@@ -371,105 +826,102 @@ static int abk_meta_mount_ensure_compat_module(void)
 
 static int abk_meta_mount_prepare_target(struct abk_meta_mount_target *target)
 {
-	char script[4096];
-	int len;
+	char *lowerdir;
+	unsigned int layers = 0;
 	int ret;
 
 	if (!target)
 		return 0;
 	target->last_attempt_jiffies = jiffies;
 	target->last_ret = 0;
+	abk_meta_mount_set_status(target, "checking");
+	abk_meta_mount_set_lowerdir(target, NULL);
+	if (!abk_meta_mount_marker_allows_mount()) {
+		abk_meta_mount_set_status(target, "other_metamodule");
+		target->last_ret = 0;
+		return 0;
+	}
 	if (target->ready) {
-		if (abk_meta_mount_is_overlay_mount(target->path))
+		if (abk_meta_mount_is_overlay_mount(target->path)) {
+			abk_meta_mount_set_status(target, "already_overlay");
 			return 0;
+		}
 		target->ready = false;
 	}
 	if (!abk_meta_mount_path_exists(target->path)) {
 		if (!(target->flags & ABK_META_MOUNT_TARGET_OPTIONAL))
 			pr_warn("abk_meta_mount: target missing: %s\n", target->path);
 		target->last_ret = (target->flags & ABK_META_MOUNT_TARGET_OPTIONAL) ? 0 : -ENOENT;
+		abk_meta_mount_set_status(target, "target_missing");
 		return (target->flags & ABK_META_MOUNT_TARGET_OPTIONAL) ? 0 : -ENOENT;
 	}
 
-	len = scnprintf(script, sizeof(script),
-		 "set -eu\n"
-		 "T='%s'\n"
-		 "N='%s'\n"
-		 "R='" ABK_META_MOUNT_ROOT "'\n"
-		 "MOD='" ABK_META_MOUNT_DATA_DIR "'\n"
-		 "MARK='" ABK_META_MOUNT_MARKER "'\n"
-		 "D=\"$R/$N\"\n"
-		 "STATUS=\"$D/status\"\n"
-		 "LOWERFILE=\"$D/lowerdir\"\n"
-		 "mkdir -p \"$D\"\n"
-		 ": > \"$STATUS\"\n"
-		 ": > \"$LOWERFILE\"\n"
-		 "if [ -e \"$MARK\" ] && [ ! -L \"$MARK\" ]; then printf 'foreign_marker\\n' > \"$STATUS\"; exit 0; fi\n"
-		 "if [ -L \"$MARK\" ]; then\n"
-		 "  CUR=$(readlink \"$MARK\" 2>/dev/null || true)\n"
-		 "  if [ \"$CUR\" != \"$MOD\" ]; then\n"
-		 "    [ -z \"$CUR\" ] || [ ! -d \"$CUR\" ] || [ -f \"$CUR/disable\" ] || [ -f \"$CUR/remove\" ] || { printf 'other_metamodule\\n' > \"$STATUS\"; exit 0; }\n"
-		 "    ln -sfn \"$MOD\" \"$MARK\"\n"
-		 "  fi\n"
-		 "fi\n"
-		 "REL=\"${T#/}\"\n"
-		 "case \"$T\" in\n"
-		 "  /system) CANDS='system' ;;\n"
-		 "  /vendor) CANDS='vendor system/vendor' ;;\n"
-		 "  /product) CANDS='product system/product' ;;\n"
-		 "  /system_ext) CANDS='system_ext system/system_ext' ;;\n"
-		 "  /odm) CANDS='odm system/odm' ;;\n"
-		 "  /oem) CANDS='oem system/oem' ;;\n"
-		 "  *) CANDS=\"$REL\" ;;\n"
-		 "esac\n"
-		 "LOWERS=''\n"
-		 "for M in /data/adb/modules/*; do\n"
-		 "  [ -d \"$M\" ] || continue\n"
-		 "  [ \"${M##*/}\" = '" ABK_META_MOUNT_ID "' ] && continue\n"
-		 "  [ -f \"$M/disable\" ] && continue\n"
-		 "  [ -f \"$M/remove\" ] && continue\n"
-		 "  [ -f \"$M/skip_mount\" ] && continue\n"
-		 "  if grep -Eq '^metamodule=(1|true)$' \"$M/module.prop\" 2>/dev/null; then continue; fi\n"
-		 "  for C in $CANDS; do\n"
-		 "    [ -d \"$M/$C\" ] || continue\n"
-		 "    LOWERS=\"$M/$C${LOWERS:+:$LOWERS}\"\n"
-		 "  done\n"
-		 "done\n"
-		 "if [ -z \"$LOWERS\" ]; then\n"
-		 "  printf 'no_candidates\\n' > \"$STATUS\"\n"
-		 "  exit 0\n"
-		 "fi\n"
-		 "LOWERS=\"$LOWERS:$T\"\n"
-		 "printf '%%s\\n' \"$LOWERS\" > \"$LOWERFILE\"\n"
-		 "mkdir -p \"$R/$N/upper\" \"$R/$N/work\"\n"
-		 "if grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1; then\n"
-		 "  printf 'already_overlay\\n' > \"$STATUS\"\n"
-		 "  exit 0\n"
-		 "fi\n"
-		 "if mount -t overlay KSU -o lowerdir=\"$LOWERS\",upperdir=\"$R/$N/upper\",workdir=\"$R/$N/work\" \"$T\" 2>/dev/null; then\n"
-		 "  if grep -F \" $T overlay \" /proc/mounts >/dev/null 2>&1; then\n"
-		 "    printf 'mounted\\n' > \"$STATUS\"\n"
-		 "    exit 0\n"
-		 "  fi\n"
-		 "fi\n"
-		 "printf 'mount_failed\\n' > \"$STATUS\"\n"
-		 "exit 4\n",
-		 target->path, target->name);
-	if (len < 0 || len >= sizeof(script)) {
-		target->last_ret = -E2BIG;
-		return -E2BIG;
+	lowerdir = kzalloc(PATH_MAX * 2, GFP_KERNEL);
+	if (!lowerdir) {
+		target->last_ret = -ENOMEM;
+		abk_meta_mount_set_status(target, "oom");
+		return -ENOMEM;
 	}
 
-	ret = abk_meta_mount_run_shell(script);
-	target->last_ret = ret;
-	if (ret)
+	ret = abk_meta_mount_collect_lowerdir(target->path, lowerdir,
+					       PATH_MAX * 2, &layers);
+	if (ret) {
+		target->last_ret = ret;
+		abk_meta_mount_set_status(target, "scan_failed");
+		kfree(lowerdir);
 		return ret;
+	}
+	if (!layers) {
+		target->last_ret = 0;
+		abk_meta_mount_set_status(target, "no_candidates");
+		kfree(lowerdir);
+		return 0;
+	}
+
+	ret = abk_meta_mount_lowerdir_append(lowerdir, PATH_MAX * 2,
+					      target->path);
+	if (ret) {
+		target->last_ret = ret;
+		abk_meta_mount_set_status(target, "lowerdir_too_long");
+		kfree(lowerdir);
+		return ret;
+	}
+
+	ret = abk_meta_mount_set_lowerdir(target, lowerdir);
+	if (ret) {
+		target->last_ret = ret;
+		abk_meta_mount_set_status(target, "oom");
+		kfree(lowerdir);
+		return ret;
+	}
 
 	if (abk_meta_mount_is_overlay_mount(target->path)) {
 		target->ready = true;
-		pr_info("abk_meta_mount: prepared %s\n", target->path);
+		target->last_ret = 0;
+		abk_meta_mount_set_status(target, "already_overlay");
+		kfree(lowerdir);
+		return 0;
 	}
-	return 0;
+
+	ret = abk_meta_mount_overlay_target(target, lowerdir);
+	target->last_ret = ret;
+	if (ret) {
+		abk_meta_mount_set_status(target, "mount_failed");
+		kfree(lowerdir);
+		return ret;
+	}
+
+	if (abk_meta_mount_is_overlay_mount(target->path)) {
+		target->ready = true;
+		abk_meta_mount_set_status(target, "mounted");
+		pr_info("abk_meta_mount: prepared %s\n", target->path);
+	} else {
+		ret = -EIO;
+		target->last_ret = ret;
+		abk_meta_mount_set_status(target, "mount_not_visible");
+	}
+	kfree(lowerdir);
+	return ret;
 }
 
 int abk_meta_mount_prepare_all(void)
@@ -583,38 +1035,9 @@ static struct kobject *abk_meta_mount_kobj;
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 
-static void abk_meta_mount_seq_print_file(struct seq_file *m, const char *path)
-{
-	struct file *file;
-	loff_t pos = 0;
-	char buf[512];
-	ssize_t len;
-
-	file = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(file)) {
-		seq_puts(m, "-");
-		return;
-	}
-
-	len = kernel_read(file, buf, sizeof(buf) - 1, &pos);
-	filp_close(file, NULL);
-	if (len <= 0) {
-		seq_puts(m, "-");
-		return;
-	}
-
-	buf[len] = '\0';
-	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-		buf[--len] = '\0';
-
-	seq_puts(m, buf);
-}
-
 static int abk_meta_mount_status_show(struct seq_file *m, void *v)
 {
 	struct abk_meta_mount_target *target;
-	char status_path[128];
-	char lower_path[128];
 
 	(void)v;
 
@@ -641,6 +1064,7 @@ static int abk_meta_mount_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "last_shell_ret=%d\n", abk_meta_mount_last_shell_ret);
 	seq_printf(m, "last_compat_ret=%d\n", abk_meta_mount_last_compat_ret);
 	seq_printf(m, "last_prepare_ret=%d\n", abk_meta_mount_last_prepare_ret);
+	seq_printf(m, "marker_owned=%d\n", abk_meta_mount_marker_owned ? 1 : 0);
 	seq_printf(m, "last_compat_age_ms=%u\n",
 		   abk_meta_mount_last_compat_jiffies ?
 		   jiffies_to_msecs(jiffies - abk_meta_mount_last_compat_jiffies) : 0);
@@ -651,17 +1075,11 @@ static int abk_meta_mount_status_show(struct seq_file *m, void *v)
 		unsigned long age_ms = target->last_attempt_jiffies ?
 			jiffies_to_msecs(jiffies - target->last_attempt_jiffies) : 0;
 
-		scnprintf(status_path, sizeof(status_path),
-			  ABK_META_MOUNT_ROOT "/%s/status", target->name);
-		scnprintf(lower_path, sizeof(lower_path),
-			  ABK_META_MOUNT_ROOT "/%s/lowerdir", target->name);
-		seq_printf(m, "target=%s ready=%d ret=%d age_ms=%lu status=",
+		seq_printf(m, "target=%s ready=%d ret=%d age_ms=%lu status=%s lowerdir=%s\n",
 			   target->path, target->ready ? 1 : 0,
-			   target->last_ret, age_ms);
-		abk_meta_mount_seq_print_file(m, status_path);
-		seq_puts(m, " lowerdir=");
-		abk_meta_mount_seq_print_file(m, lower_path);
-		seq_putc(m, '\n');
+			   target->last_ret, age_ms,
+			   target->last_status[0] ? target->last_status : "-",
+			   target->last_lowerdir ? target->last_lowerdir : "-");
 	}
 	mutex_unlock(&abk_meta_mount_lock);
 
@@ -826,6 +1244,7 @@ static void __exit abk_meta_mount_exit(void)
 	mutex_lock(&abk_meta_mount_lock);
 	list_for_each_entry_safe(target, next, &abk_meta_mount_targets, node) {
 		list_del(&target->node);
+		kfree(target->last_lowerdir);
 		kfree(target);
 	}
 	mutex_unlock(&abk_meta_mount_lock);

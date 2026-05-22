@@ -5,6 +5,8 @@
 #include <linux/bits.h>
 #include <linux/types.h>
 
+struct path;
+
 #define ABK_META_MOUNT_ID "meta-abk-mount"
 
 enum abk_meta_mount_target_flags {
@@ -18,5 +20,8 @@ bool abk_meta_mount_is_ready(const char *path);
 int abk_meta_mount_set_enabled(bool enabled);
 int abk_meta_mount_register_target(const char *path, unsigned long flags);
 int abk_meta_mount_prepare_all(void);
+int path_mount(const char *dev_name, struct path *path, const char *type_page,
+	       unsigned long flags, void *data_page);
+int path_umount(struct path *path, int flags);
 
 #endif /* _LINUX_ABK_META_MOUNT_H */
